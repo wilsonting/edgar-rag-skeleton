@@ -1,0 +1,16 @@
+[project]
+name="edgar-rag-skeleton"
+version="0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi[standard]==0.115.6",
+    "uvicorn[standard]==0.32.0",
+    "pydantic==2.9.0",
+    "psycopg[binary]>=3.3.4",
+    "pgvector>=0.4.2",
+    "anthropic>=0.105.2",
+    "openai>=1.109.1",
+    "pypdf==5.0.0",
+    "python-dotenv==1.0.0",
+    "tiktoken==0.8.0"
+]
