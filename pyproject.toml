@@ -12,5 +12,7 @@ dependencies = [
     "openai>=1.109.1",
     "pypdf==5.0.0",
     "python-dotenv==1.0.0",
-    "tiktoken==0.8.0"
+    "tiktoken==0.8.0",
+    "typer==0.15.1",
+    "httpx==0.28.1"
 ]

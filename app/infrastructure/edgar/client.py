@@ -34,7 +34,7 @@ class EdgarClient:
     ) -> None:
         if not user_agent or "@" not in user_agent:
             raise ValueError(
-                "user_agent must include name and email, e.g. 'Wilson Ting wilson@example.com'"
+                "user_agent must include name and email"
             )
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
