@@ -16,7 +16,7 @@ class TickerResolver:
     Caches the map locally and refreshes weekly.
     """
 
-    def __init__(self, user_agent: str, cache_path: Path) -> None:
+    def __init__(self, user_agent: str, cache_path: Path):
         self.user_agent = user_agent
         self.cache_path = cache_path
         self._index: dict[str, str] | None = None # ticker (upper) -> cik (padded)
@@ -28,7 +28,16 @@ class TickerResolver:
         if self._needs_refresh():
             await self._download()
 
-    def _need_refresh(self) -> bool:
+        raw = json.loads(self.cache_path.read_text())
+        # SEC's format is a dict of stringified-int -> {cik_str, ticker, title}
+        index = {
+            entry["ticker"].upper(): str(entry["cik_str"]).zfill(10)
+            for entry in raw.values()
+        }
+        self._index = index
+        return index
+
+    def _needs_refresh(self) -> bool:
         if not self.cache_path.exists():
             return True
         age =  datetime.now() -  datetime.fromtimestamp(self.cache_path.stat().st_mtime)
@@ -46,5 +55,7 @@ class TickerResolver:
 
     async def resolve(self, ticker: str) -> str | None:
         """Return zero-padded 10-digit CIK, or None if ticker unknown."""
+        if not ticker:
+            raise ValueError("ticket cannot be None")
         index = await self._load()
         return index.get(ticker.upper())

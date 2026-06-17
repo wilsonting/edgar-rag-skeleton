@@ -10,6 +10,7 @@ class FilingSummary:
     filing_date: date
     filing_data: date | None # period of report
     primary_document: str    # "aapl-20240928.htm"
+    report_date: date | None
 
     @property
     def accession_no_dashes(self) -> str:

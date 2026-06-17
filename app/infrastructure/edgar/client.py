@@ -46,7 +46,7 @@ class EdgarClient:
                 "User-Agent" : user_agent,
                 "Accept-Encoding": "gzip, deflate"
             },
-            timeout=httpx.httpx.Timeout(30.0, connect=10.0),
+            timeout=httpx.Timeout(30.0, connect=10.0),
             follow_redirects=True
         )
 
@@ -122,6 +122,7 @@ class EdgarClient:
                     filing_date=filing_date,
                     report_date=report_date,
                     primary_document=primary_docs[i],
+                    filing_data=data
                 )
             )
 
