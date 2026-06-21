@@ -16,5 +16,8 @@ dependencies = [
     "typer==0.26.7",
     "httpx==0.28.1",
     "beautifulsoup4>=4.14.2",
-    "lxml>=6.1.1"
+    "lxml>=6.1.1",
+    "sqlalchemy[asyncio]>=2.0.51",
+    "alembic>=1.18.4",
+    "asyncpg>=0.31.0"
 ]
