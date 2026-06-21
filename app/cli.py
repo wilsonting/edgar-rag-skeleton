@@ -10,6 +10,8 @@ from dotenv import load_dotenv
 
 from infrastructure.edgar.client import EdgarClient
 from infrastructure.edgar.ticker_resolver import TickerResolver
+from infrastructure.chunking.section_chunker import chunk_filing
+from infrastructure.parsing.filing_parser import parse_filing
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -31,6 +33,60 @@ def fetch(
     """Fetch recent filings of a given form type for a ticker."""
     asyncio.run(_fetch(ticker, form_type, limit, since_year))
 
+@app.command(name="inspect-chunks")
+def inspect_chunks(
+    html_path: Path,
+    target_tokens: int = 600,
+    overlap_tokens: int = 80,
+    preview_chars: int = 400,
+    show_first: int = 10,
+    json_out: bool = False,
+):
+    """Parse and chunk one filing; print sections + sample chunks for review."""
+    sections = parse_filing(html_path)
+    chunks = chunk_filing(sections, target_tokens, overlap_tokens)
+
+    if json_out:
+        typer.echo(
+            json.dumps(
+                [
+                    {
+                        "section_path": c.section_path,
+                        "chunk_index": c.chunk_index,
+                        "token_count": c.token_count,
+                        "content": c.content,
+                    }
+                    for c in chunks
+                ],
+                indent=2,
+            )
+        )
+        return
+
+    typer.echo(f"\nFiling: {html_path}")
+    typer.echo(f"Sections detected: {len(sections)}")
+    typer.echo(f"Chunks produced:   {len(chunks)}")
+    if chunks:
+        avg = sum(c.token_count for c in chunks) / len(chunks)
+        mx = max(c.token_count for c in chunks)
+        mn = min(c.token_count for c in chunks)
+        typer.echo(f"Token stats:       min={mn}  avg={avg:.0f}  max={mx}\n")
+
+    typer.echo("=== Section index ===")
+    for s in sections:
+        typer.echo(f"  [{s.order:>3}] {' > '.join(s.section_path)}")
+
+    typer.echo(f"\n=== First {min(show_first, len(chunks))} chunks ===")
+    for c in chunks[:show_first]:
+        path = " > ".join(c.section_path)
+        typer.echo(f"\n--- Chunk {c.chunk_index:04d}  ({c.token_count} tokens) ---")
+        typer.echo(f"section: {path}")
+        typer.echo("-" * 60)
+        preview = c.content[:preview_chars]
+        if len(c.content) > preview_chars:
+            preview += "…"
+        typer.echo(preview)
+        
 
 async def _fetch(ticker: str, form_type: str, limit: int, since_year: int | None) -> None:
     user_agent = os.environ["EDGAR_USER_AGENT"]  # "Wilson Ting wilson@example.com"
