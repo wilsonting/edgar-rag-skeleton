@@ -112,5 +112,53 @@ async def _fetch(ticker: str, form_type: str, limit: int, since_year: int | None
             typer.echo(f"  cached at {path}  ({path.stat().st_size:,} bytes)")
 
 
+@app.command(name="smoke-persist")
+def smoke_persist(ticker: str = "AAPL"):
+    """Smoke test the vertical slice: Insert one ListedSecurity + Filing to verify the repository layer."""
+    import asyncio
+    asyncio.run(_smoke_persist(ticker))
+    
+async def _smoke_persist(ticker: str) -> None:
+    from datetime import date
+    from domain.listed_security import ListedSecurity
+    from domain.filing import Filing
+    from domain.values import FilingStatus
+    from infrastructure.repositories.db import init_pool, close_pool
+    from infrastructure.repositories.listed_security_repo import (
+        ListedSecurityRepository,
+    )
+    from infrastructure.repositories.filing_repo import FilingRepository
+
+    await init_pool()
+    try:
+        sec_repo = ListedSecurityRepository()
+        fil_repo = FilingRepository()
+
+        security = ListedSecurity(
+            cik="320193", ticker=ticker, exchange="NASDAQ", name="Apple Inc."
+        )
+        security = await sec_repo.upsert(security)
+        typer.echo(f"Saved security: id={security.id} cik={security.cik}")
+
+        filing = Filing(
+            security_id=security.id,
+            filing_type="10-K",
+            filed_date=date(2022, 10, 28),
+            period_of_report=date(2022, 9, 24),
+            accession_number="0000320193-22-000108",
+            status=FilingStatus.DISCOVERED,
+        )
+        filing = await fil_repo.upsert(filing)
+        typer.echo(f"Saved filing: id={filing.id} status={filing.status}")
+
+        await fil_repo.mark_status(filing.id, FilingStatus.DOWNLOADED)
+        typer.echo("Transitioned to DOWNLOADED")
+
+        roundtrip = await fil_repo.get_by_accession(filing.accession_number)
+        typer.echo(f"Roundtrip: {roundtrip}")
+    finally:
+        await close_pool()
+
+
 if __name__ == "__main__":
     app()
