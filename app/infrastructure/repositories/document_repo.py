@@ -1,4 +1,4 @@
-from domain.document import Document
+from app.domain.document import Document
 from .db import get_connection
 
 class DocumentRepository:

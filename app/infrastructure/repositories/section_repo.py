@@ -1,6 +1,7 @@
 from psycopg.types.json import Json
-from domain.section import Section
+from app.domain.section import Section
 from .db import get_connection
+
 
 
 class SectionRepository:

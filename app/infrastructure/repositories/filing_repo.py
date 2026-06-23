@@ -1,7 +1,7 @@
 from datetime import date
 
-from domain.filing import Filing
-from domain.values import FilingStatus
+from app.domain.filing import Filing
+from app.domain.values import FilingStatus
 from .db import get_connection
 
 class FilingRepository:

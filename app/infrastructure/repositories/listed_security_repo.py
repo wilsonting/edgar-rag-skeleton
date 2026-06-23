@@ -1,4 +1,4 @@
-from domain.listed_security import ListedSecurity
+from app.domain.listed_security import ListedSecurity
 from .db import get_connection
 
 class ListedSecurityRepository:

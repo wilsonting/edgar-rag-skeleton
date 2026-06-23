@@ -8,10 +8,10 @@ from pathlib import Path
 import typer
 from dotenv import load_dotenv
 
-from infrastructure.edgar.client import EdgarClient
-from infrastructure.edgar.ticker_resolver import TickerResolver
-from infrastructure.chunking.section_chunker import chunk_filing
-from infrastructure.parsing.filing_parser import parse_filing
+from app.infrastructure.edgar.client import EdgarClient
+from app.infrastructure.edgar.ticker_resolver import TickerResolver
+from app.infrastructure.chunking.section_chunker import chunk_filing
+from app.infrastructure.parsing.filing_parser import parse_filing
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -120,14 +120,14 @@ def smoke_persist(ticker: str = "AAPL"):
     
 async def _smoke_persist(ticker: str) -> None:
     from datetime import date
-    from domain.listed_security import ListedSecurity
-    from domain.filing import Filing
-    from domain.values import FilingStatus
-    from infrastructure.repositories.db import init_pool, close_pool
-    from infrastructure.repositories.listed_security_repo import (
+    from app.domain.listed_security import ListedSecurity
+    from app.domain.filing import Filing
+    from app.domain.values import FilingStatus
+    from app.infrastructure.repositories.db import init_pool, close_pool
+    from app.infrastructure.repositories.listed_security_repo import (
         ListedSecurityRepository,
     )
-    from infrastructure.repositories.filing_repo import FilingRepository
+    from app.infrastructure.repositories.filing_repo import FilingRepository
 
     await init_pool()
     try:
@@ -159,6 +159,66 @@ async def _smoke_persist(ticker: str) -> None:
     finally:
         await close_pool()
 
+@app.command(name="ingest")
+def ingest_cmd(
+    ticker: str,
+    form_type: str = typer.Option("10-K", "--type"),
+    limit: int = typer.Option(4, "--limit"),
+    since_year: int | None = typer.Option(None, "--since"),
+):
+    """Run the full ingestion pipeline for one ticker."""
+    asyncio.run(_ingest(ticker, form_type, limit, since_year))
+
+
+async def _ingest(
+    ticker: str, form_type: str, limit: int, since_year: int | None
+) -> None:
+    import os
+    from datetime import date
+    from app.infrastructure.edgar.client import EdgarClient
+    from app.infrastructure.edgar.ticker_resolver import TickerResolver
+    from app.infrastructure.repositories.db import init_pool, close_pool
+    from app.infrastructure.repositories.listed_security_repo import (
+        ListedSecurityRepository,
+    )
+    from app.infrastructure.repositories.filing_repo import FilingRepository
+    from app.infrastructure.repositories.document_repo import DocumentRepository
+    from app.infrastructure.repositories.section_repo import SectionRepository
+    from app.infrastructure.repositories.chunk_repo import ChunkRepository
+    from app.application.embedding_service import EmbeddingService
+    from app.application.ingestion_service import IngestionService
+
+    user_agent = os.environ["EDGAR_USER_AGENT"]
+    cache_root = Path(os.environ.get("EDGAR_CACHE_DIR", "./data/edgar-cache"))
+
+    await init_pool()
+    try:
+        async with EdgarClient(user_agent, cache_root / "filings") as edgar:
+            resolver = TickerResolver(
+                user_agent, cache_root / "company_tickers.json"
+            )
+            embedder = EmbeddingService()
+
+            service = IngestionService(
+                edgar_client=edgar,
+                ticker_resolver=resolver,
+                embedding_service=embedder,
+                security_repo=ListedSecurityRepository(),
+                filing_repo=FilingRepository(),
+                document_repo=DocumentRepository(),
+                section_repo=SectionRepository(),
+                chunk_repo=ChunkRepository(),
+            )
+
+            since = date(since_year, 1, 1) if since_year else None
+            await service.ingest_security(
+                ticker=ticker,
+                form_types=[form_type],
+                limit=limit,
+                since=since,
+            )
+    finally:
+        await close_pool()
 
 if __name__ == "__main__":
     app()
