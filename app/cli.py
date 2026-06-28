@@ -12,6 +12,7 @@ from app.infrastructure.edgar.client import EdgarClient
 from app.infrastructure.edgar.ticker_resolver import TickerResolver
 from app.infrastructure.chunking.section_chunker import chunk_filing
 from app.infrastructure.parsing.filing_parser import parse_filing
+from app.infrastructure.queries.models import FilingDetail, FilingIssue
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -169,6 +170,111 @@ def ingest_cmd(
     """Run the full ingestion pipeline for one ticker."""
     asyncio.run(_ingest(ticker, form_type, limit, since_year))
 
+@app.command(name="corpus-status")
+def corpus_status_cmd(
+    ticker: str | None = typer.Option(None, "--ticker", "-t"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Print a summary of what's actually in the corpus."""
+    asyncio.run(_corpus_status(ticker, verbose))
+
+async def _corpus_status(ticker: str | None, verbose: bool) -> None:
+    from app.infrastructure.repositories.db import init_pool, close_pool
+    from app.infrastructure.queries.corpus_status import CorpusStatusQuery
+
+    await init_pool()
+    try:
+        query = CorpusStatusQuery()
+        summary = await query.summary(ticker)
+        if not summary:
+            typer.echo("Corpus is empty.")
+            return
+
+        _print_summary_table(summary)
+
+        issues = await query.issues(ticker)
+        if issues:
+            _print_issues(issues)
+        else:
+            typer.echo("\nāœ“ No stuck or failed filings.")
+
+        if verbose:
+            details = await query.per_filing(ticker)
+            _print_per_filing(details)
+    finally:
+        await close_pool()
+
+def _print_summary_table(rows: list[dict]) -> None:
+    from datetime import datetime
+    typer.echo(f"\nCorpus status — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    header = f"{'ticker':<8} {'filings':>7} {'earliest':>12} {'latest':>12} " \
+             f"{'embedded':>9} {'partial':>8} {'failed':>7} {'chunks':>9}"
+    typer.echo(header)
+    typer.echo("─" * len(header))
+
+    total_filings = total_chunks = 0
+    for r in rows:
+        line = (
+            f"{r.ticker:<8} "
+            f"{r.filings:>7} "
+            f"{str(r.earliest or '—'):>12} "
+            f"{str(r.latest or '—'):>12} "
+            f"{r.embedded:>9} "
+            f"{r.partial:>8} "
+            f"{r.failed:>7} "
+            f"{r.chunks:>9,}"
+        )
+        typer.echo(line)
+        total_filings += r.filings
+        total_chunks += r.chunks
+
+    typer.echo("─" * len(header))
+    typer.echo(
+        f"Total: {len(rows)} securities, {total_filings} filings, "
+        f"{total_chunks:,} chunks"
+    )
+
+
+def _print_issues(issues: list[FilingIssue]) -> None:
+    typer.echo("\n⚠ļø  Issues:")
+    for i in issues:
+        age = ""
+        if i.updated_at:
+            from datetime import datetime, timezone
+            delta = datetime.now(timezone.utc) - i.updated_at
+            age = f" ({delta.days}d ago)" if delta.days > 0 else f" ({delta.seconds // 3600}h ago)"
+
+        line = (
+            f"  - {i.ticker} {i.filing_type} "
+            f"({i.accession_number}): {i.status}{age}"
+        )
+        if i.error_message:
+            line += f"\n    → {i.error_message}"
+        typer.echo(line)
+
+
+def _print_per_filing(rows: list[FilingDetail]) -> None:
+    typer.echo("\nPer-filing breakdown:\n")
+    header = f"{'ticker':<8} {'accession':<24} {'type':<6} {'filed':<12} " \
+             f"{'status':<11} {'chunks':>7} {'emb':>5}"
+    typer.echo(header)
+    typer.echo("─" * len(header))
+
+    for r in rows:
+        emb_pct = ""
+        if r.chunks:
+            pct = 100 * r.embedded / r.chunks
+            emb_pct = f"{pct:.0f}%"
+        typer.echo(
+            f"{r.ticker:<8} "
+            f"{r.accession_number:<24} "
+            f"{r.filing_type:<6} "
+            f"{str(r.filed_date):<12} "
+            f"{r.status:<11} "
+            f"{r.chunks:>7,} "
+            f"{emb_pct:>5}"
+        )
 
 async def _ingest(
     ticker: str, form_type: str, limit: int, since_year: int | None

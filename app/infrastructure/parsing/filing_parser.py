@@ -105,28 +105,50 @@ def _flatten_to_text_blocks(soup: BeautifulSoup) -> list[str]:
 def _locate_item_headings(blocks: list[str]) -> list[tuple[int, str, str]]:
     """
     Find blocks that look like 'Item N[A]. <title>' headings.
-    Returns list of (block_index, item_number, title) in document order.
 
-    Filters out table-of-contents repeats by keeping only the LAST occurrence
-    of each item (TOC comes first, content comes later).
+    Multiple occurrences of the same Item are common (TOC + content).
+    We prefer the occurrence with the most content between it and the
+    NEXT Item heading — that's the real section, not a TOC entry.
     """
     candidates: dict[str, list[tuple[int, str]]] = {}
     for i, block in enumerate(blocks):
         m = _ITEM_HEADING_RE.match(block)
         if not m:
             continue
-        item_no = m.group(1).upper()
-        # Reject if the "heading" is suspiciously long (real headings are short)
         if len(block) > 200:
             continue
+        item_no = m.group(1).upper()
         title = (m.group(2) or "").strip(" .:—–-")
         candidates.setdefault(item_no, []).append((i, title))
 
-    # Keep the LAST occurrence of each item — that's the actual section,
-    # earlier ones are typically the TOC.
+    if not candidates:
+        return []
+
+    # Flatten all (block_idx, item_no, title) candidates and sort by position
+    all_positions = sorted(
+        (idx, item_no, title)
+        for item_no, occurrences in candidates.items()
+        for idx, title in occurrences
+    )
+
+    # For each item_no, pick the occurrence with the most blocks before
+    # the NEXT heading-of-any-kind. Real content sections have body
+    # between them; TOC entries are packed together.
+    occurrence_scores: dict[str, list[tuple[int, str, int]]] = {}
+    for n, (idx, item_no, title) in enumerate(all_positions):
+        next_idx = (
+            all_positions[n + 1][0]
+            if n + 1 < len(all_positions)
+            else len(blocks)
+        )
+        gap = next_idx - idx - 1  # blocks of body between this heading and next
+        occurrence_scores.setdefault(item_no, []).append((idx, title, gap))
+
     located: list[tuple[int, str, str]] = []
-    for item_no, occurrences in candidates.items():
-        idx, title = occurrences[-1]
+    for item_no, occurrences in occurrence_scores.items():
+        # Best occurrence = the one with the largest body gap
+        best = max(occurrences, key=lambda x: x[2])
+        idx, title, _ = best
         located.append((idx, item_no, title))
 
     located.sort(key=lambda x: x[0])

@@ -105,3 +105,5 @@ Handled in `main.py`, using `RetrievalService` and `llm.answer_question()`:
 - **Denormalized chunk metadata** trades storage for retrieval latency: metadata filters apply as cheap indexed predicates before the more expensive HNSW vector scan.
 - **TOC deduplication** in the parser (`filing_parser._locate_item_headings`) is a load-bearing detail — without it, sections capture empty table-of-contents entries instead of actual content, since EDGAR filings repeat "Item N" headings in both the TOC and the body.
 - **Citation format is intentionally lightweight** (`[TICKER FORM YEAR §Item]`, no chunk ID) — sufficient for traceability without complicating the prompt.
+- **Aggregate lifecycle vs read-side queries** - Repositories handle aggregate lifecycle (insert, update, find). Cross-aggregate read queries live under infrastructure/queries/ to keep write-side and read-side concerns visibly separate.
+- Read-side queries return frozen dataclasses rather than dicts — moves field-name errors from runtime puzzles to static-checker / immediate-crash failures.
