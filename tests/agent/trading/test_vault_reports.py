@@ -145,7 +145,7 @@ def _memo(**over) -> DecisionMemo:
         risk_debate_summary="STUB — Phase 6",
         technical_signal="RSI at 36.2 indicates oversold conditions.",
         reasoning="STUB — synthesis logic not yet implemented.",
-        suggested_strategy="STUB",
+        watch_items=[],
         verdict=Verdict.HOLD,
         confidence=0.0,
         data_as_of_date=AS_OF,
@@ -197,4 +197,14 @@ def test_gaps_are_rendered_and_counted():
 
     empty = _format_memo_markdown(_memo(data_gaps=[]))
     assert "## Data gaps (0)" in empty
+    assert "_None recorded._" in empty
+
+
+def test_watch_items_are_rendered_and_counted():
+    md = _format_memo_markdown(_memo(watch_items=["closes below 850", "Q3 margin print"]))
+    assert "## Watch items (2)" in md
+    assert "- closes below 850" in md and "- Q3 margin print" in md
+
+    empty = _format_memo_markdown(_memo(watch_items=[]))
+    assert "## Watch items (0)" in empty
     assert "_None recorded._" in empty

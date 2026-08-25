@@ -235,7 +235,7 @@ _SIGNED_NUMBER = r"(?<![\d.%])-?\d+\.?\d*"
 _PERIOD_LABEL = re.compile(r"\b\d+-day\b|\b\d+-(?=\s+(?:and|or|to)\s)")
 
 
-def _flag_unmatched_numbers(text: str, indicators: TechnicalIndicators) -> list[str]:
+def _flag_unmatched_numbers_against(text: str, known_values: list[float]) -> list[str]:
     """Cheap guard, not a full verifier: extract numbers mentioned in the interpretation
     and check each is within rounding tolerance of some value actually in `indicators`.
     Flags (doesn't block) anything that doesn't match — surfaced in TechnicalReport for
@@ -284,8 +284,6 @@ def _flag_unmatched_numbers(text: str, indicators: TechnicalIndicators) -> list[
     threshold false positives above ("RSI above 70"), the number was a
     genuine indicator value that the scanner mangled before comparing it.
     """
-    known_values = [v for v in indicators.model_dump().values() if isinstance(v, (int, float))]
-
     # Normalize U+2212 MINUS SIGN to ASCII before anything reads a sign. The
     # model writes typographic minus roughly one run in four — "negative
     # histogram of −3.23" — and _SIGNED_NUMBER only knows the ASCII hyphen, so
@@ -328,6 +326,22 @@ def _flag_unmatched_numbers(text: str, indicators: TechnicalIndicators) -> list[
         flagged.append(m)
 
     return flagged
+
+
+
+def _flag_unmatched_numbers(text: str, indicators: TechnicalIndicators) -> list[str]:
+    """Unchanged public signature — the Phase 3 tests keep passing untouched.
+
+    The list-taking form above was extracted so Phase 5's debate guard can
+    reuse the percent transforms over numbers scraped out of the analyst
+    reports. The alternative — handing this function a fake object with a
+    `model_dump()` — would make the debate depend on a duck-typed shim that
+    no test covers.
+    """
+    return _flag_unmatched_numbers_against(
+        text,
+        [v for v in indicators.model_dump().values() if isinstance(v, (int, float))],
+    )
 
 
 # The conventional RSI band edges. These are constants of the indicator, not

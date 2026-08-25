@@ -13,9 +13,40 @@ from datetime import date, timedelta
 import pytest
 
 import app.agent.trading.application.nodes as nodes
-from app.agent.trading.domain.news_digest import NewsDigest, NewsItem
+from app.agent.trading.domain.decision_memo import DecisionMemo, Verdict
+from app.agent.trading.domain.news_digest import NewsDigest, NewsItem, SentimentSummary
 
 AS_OF = date(2025, 3, 15)
+
+
+@pytest.fixture(autouse=True)
+def _stub_synthesis(monkeypatch):
+    """This file is about what the NEWS leg contributes to the memo's
+    data_gaps/evidence via `_news_caveats` — not about the synthesis LLM
+    call, which every test below would otherwise hit for real through
+    `nodes.synthesizer_node`. Stubbed at the same seam
+    test_debate_graph.py's `_stub_synthesis` uses: the memo is built
+    directly from the caveats synthesizer_node already computed in Python
+    (base_gaps/base_evidence), so every assertion on memo.data_gaps /
+    memo.evidence below still exercises the real caveat logic."""
+    async def fake_run_synthesis(state, *, ledger, base_gaps, base_evidence, as_of, client=None):
+        return DecisionMemo(
+            ticker=state["ticker"],
+            bull_case="stub bull",
+            bear_case="stub bear",
+            risk_debate_summary="stub risk narrative",
+            technical_signal="NOT RUN — technical analyst was excluded from this run",
+            reasoning="stub reasoning",
+            watch_items=[],
+            verdict=Verdict.HOLD,
+            confidence=0.0,
+            data_as_of_date=as_of,
+            data_gaps=base_gaps,
+            assumptions=[],
+            evidence=base_evidence,
+        )
+
+    monkeypatch.setattr(nodes, "run_synthesis", fake_run_synthesis)
 
 
 def _item(pub: date, sentiment: str = "neutral", relevance: str = "primary") -> NewsItem:
@@ -228,3 +259,152 @@ async def test_sentiment_node_handles_empty_digest_as_valid():
     assert s.net_score == 0.0
     assert s.excluded_by_relevance == 0
     assert (s.positive, s.negative, s.neutral) == (0, 0, 0)
+
+
+# ---------------------------------------------------------------------------
+# What the news leg contributes to the DecisionMemo
+# ---------------------------------------------------------------------------
+
+def _synth_state(**over) -> dict:
+    digest = _digest([_item(AS_OF, "positive")])
+    state = {
+        "ticker": "ACN",
+        "as_of_date": AS_OF,
+        "news_digest": digest,
+        "news_digest_issues": [],
+        "sentiment_summary": SentimentSummary(
+            ticker="ACN", as_of_date=AS_OF, positive=8, negative=2, neutral=2,
+            net_score=0.5, article_count=12, excluded_by_relevance=40,
+        ),
+    }
+    state.update(over)
+    return state
+
+
+@pytest.mark.anyio
+async def test_memo_is_dated_by_the_run_not_the_wall_clock():
+    """date.today() belongs at the CLI boundary and nowhere else. Dating the
+    memo by execution time silently misdates every historical probe: the memo
+    would claim to be current as of today while describing a window from
+    months earlier."""
+    probe = date(2025, 3, 1)
+    state = _synth_state(as_of_date=probe)
+    state["news_digest"] = NewsDigest(
+        ticker="ACN", as_of_date=probe, window_start=probe - timedelta(days=14),
+        items=[], raw_article_count=0, deduped_count=0, dropped_out_of_window=0,
+        dropped_missing_date=0, truncated_by_cap=False,
+    )
+
+    memo = (await nodes.synthesizer_node(state))["decision_memo"]
+
+    assert memo.data_as_of_date == probe
+    assert memo.data_as_of_date != date.today()
+
+
+@pytest.mark.anyio
+async def test_synthesizer_refuses_to_date_a_memo_without_as_of():
+    state = _synth_state()
+    del state["as_of_date"]
+
+    with pytest.raises(ValueError, match="refusing to date a memo"):
+        await nodes.synthesizer_node(state)
+
+
+@pytest.mark.anyio
+async def test_truncated_digest_is_declared_a_sample_in_the_memo():
+    """A truncated digest saw part of the window. A reader acting on the memo
+    alone previously had no way to know that — the flag existed on the digest
+    and stopped there."""
+    state = _synth_state()
+    state["news_digest"] = NewsDigest(
+        ticker="ACN", as_of_date=AS_OF, window_start=AS_OF - timedelta(days=14),
+        items=[_item(AS_OF, "positive")], raw_article_count=500, deduped_count=300,
+        dropped_out_of_window=0, dropped_missing_date=0, truncated_by_cap=True,
+    )
+
+    memo = (await nodes.synthesizer_node(state))["decision_memo"]
+    gaps = " ".join(memo.data_gaps)
+
+    assert "SAMPLE" in gaps and "500" in gaps
+    assert "skews to the most recent days" in gaps
+
+
+@pytest.mark.anyio
+async def test_digest_integrity_issues_reach_the_memo():
+    state = _synth_state(
+        news_digest_issues=["missing index 3: 'ACN cuts guidance'", "duplicate index 1"]
+    )
+
+    memo = (await nodes.synthesizer_node(state))["decision_memo"]
+    gaps = " ".join(memo.data_gaps)
+
+    assert "2 digest integrity issue(s)" in gaps
+    assert "ACN cuts guidance" in gaps
+
+
+@pytest.mark.anyio
+async def test_sentiment_signal_becomes_memo_evidence():
+    memo = (await nodes.synthesizer_node(_synth_state()))["decision_memo"]
+
+    assert len(memo.evidence) == 1
+    ev = memo.evidence[0]
+    assert "+0.50" in ev and "12 article(s)" in ev
+    assert "40 further article(s)" in ev      # the excluded count travels too
+
+
+@pytest.mark.anyio
+async def test_zero_relevant_articles_is_declared_absence_not_neutrality():
+    """The failure this guards: a 0.00 score read as 'the market is
+    indifferent' when it actually means nothing in the window was about the
+    company."""
+    state = _synth_state(
+        sentiment_summary=SentimentSummary(
+            ticker="ACN", as_of_date=AS_OF, positive=0, negative=0, neutral=0,
+            net_score=0.0, article_count=0, excluded_by_relevance=60,
+        )
+    )
+
+    memo = (await nodes.synthesizer_node(state))["decision_memo"]
+    gaps = " ".join(memo.data_gaps)
+
+    assert "ABSENCE of evidence" in gaps
+    assert "60 were excluded" in gaps
+    assert memo.evidence == []      # nothing was found, so nothing is claimed
+
+
+@pytest.mark.anyio
+async def test_thin_sample_is_flagged_but_a_healthy_one_is_not():
+    thin = _synth_state(
+        sentiment_summary=SentimentSummary(
+            ticker="ACN", as_of_date=AS_OF, positive=2, negative=0, neutral=0,
+            net_score=1.0, article_count=2, excluded_by_relevance=5,
+        )
+    )
+
+    thin_memo = (await nodes.synthesizer_node(thin))["decision_memo"]
+    healthy_memo = (await nodes.synthesizer_node(_synth_state()))["decision_memo"]
+
+    assert any("rests on only 2 article(s)" in g for g in thin_memo.data_gaps)
+    assert not any("rests on only" in g for g in healthy_memo.data_gaps)
+
+
+@pytest.mark.anyio
+async def test_a_clean_digest_adds_no_spurious_caveats():
+    """The caveats must be earned. A full, healthy digest should leave the
+    memo's gap list exactly as it was before the news leg contributed."""
+    memo = (await nodes.synthesizer_node(_synth_state()))["decision_memo"]
+
+    for noise in ("SAMPLE", "integrity issue", "ABSENCE", "rests on only"):
+        assert not any(noise in g for g in memo.data_gaps), noise
+
+
+@pytest.mark.anyio
+async def test_news_not_run_still_reports_it_and_claims_nothing():
+    """A skipped analyst and a quiet one must stay distinguishable."""
+    state = _synth_state()
+    del state["news_digest"], state["sentiment_summary"]
+
+    memo = (await nodes.synthesizer_node(state))["decision_memo"]
+
+    assert any("news analyst did not run" in g for g in memo.data_gaps)
+    assert memo.evidence == []

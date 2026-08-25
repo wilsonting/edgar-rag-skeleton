@@ -60,11 +60,11 @@ def _format_memo_markdown(memo: DecisionMemo) -> str:
         "",
         _render(memo.risk_debate_summary),
         "",
-        "## Suggested strategy",
-        "",
-        _render(memo.suggested_strategy),
+        f"## Watch items ({len(memo.watch_items)})",
         "",
     ]
+    lines += [f"- {w}" for w in memo.watch_items] if memo.watch_items else ["_None recorded._"]
+    lines += [""]
 
     # Gaps come before evidence deliberately: what the memo did not see
     # bounds what its evidence can support.

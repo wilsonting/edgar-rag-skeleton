@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations  
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -57,6 +58,16 @@ _MODEL_PRICING = {
         "cache_read": 0.10,
     },
     "claude-sonnet-4-5-20250929": {
+        "input": 3.00,
+        "output": 15.00,
+        "cache_write": 3.75,
+        "cache_read": 0.30,
+    },
+    # Sonnet 5 carries an introductory $2/$10 through 2026-08-31 and reverts
+    # to $3/$15 on Sep 1. Budgeted at the standing rate deliberately: pricing
+    # the intro here would make every debate-cost assertion start failing on
+    # a date nobody was watching, and over-estimating cost fails safe.
+    "claude-sonnet-5": {
         "input": 3.00,
         "output": 15.00,
         "cache_write": 3.75,
@@ -122,7 +133,65 @@ def _build_news_prompt(ticker: str, news_text: str) -> str:
 # trace the preceding fundamentals run left behind — writing it would pair
 # the wrong evidence with the report. They supply their own provenance or
 # get none.
-_NO_SESSION_LOG_MODES = {"technical", "sentiment", "decision"}
+_NO_SESSION_LOG_MODES = {"technical", "sentiment", "decision", "debate", "risk"}
+
+
+# The vault filename stem for each mode, minus the ticker. "fundamentals" is
+# the mode but "fundamental" is the filename, which is a wart old enough to
+# be in people's muscle memory — kept rather than fixed, since renaming it
+# would orphan every existing note's links.
+_MODE_STEMS = {
+    "news": "news",
+    "technical": "technical",
+    "fundamentals": "fundamental",
+    "sentiment": "sentiment",
+    "decision": "decision",
+    "debate": "debate",
+    "risk": "risk",
+}
+
+# Modes that file under MEMO_DIR/<ticker>/<date>/ rather than flat under the
+# ticker. Everything the trading pipeline writes, which is what makes a
+# per-run folder worth having at all.
+_DATED_MODES = frozenset({"technical", "fundamentals", "sentiment", "decision", "debate", "risk"})
+
+# The instant one pipeline run started, set by `vault_run`; None outside one.
+#
+# A module global rather than a parameter threaded through six ports, because
+# the two halves of a run save at different times and through different call
+# stacks — technical and fundamentals from inside their nodes while the graph
+# is still executing, sentiment/decision/debate from the CLI after it
+# finishes. Anything computed per call (including datetime.now()) puts those
+# halves in different folders, which is the problem being fixed.
+#
+# The whole datetime, not the formatted name: the DATE folder has to come
+# from the same instant too. A run that starts at 23:58 and finishes at
+# 00:02 would otherwise file its fundamentals under one date and its debate
+# transcript under the next — the same scattering, harder to spot.
+_RUN_STAMP: datetime | None = None
+
+
+@contextlib.contextmanager
+def vault_run(stamp: datetime | None = None):
+    """Give every artifact saved inside this block ONE run folder.
+
+    Yields the folder name. The directory is not created here — it is created
+    by the first `_save_output` that lands in it, so a run that dies before
+    writing anything leaves no empty folder behind.
+
+    Restores whatever was set before rather than clearing to None, so nesting
+    is safe even though nothing nests today.
+    """
+    global _RUN_STAMP
+    previous = _RUN_STAMP
+    _RUN_STAMP = stamp or datetime.now()
+    try:
+        yield _RUN_STAMP.strftime(_RUN_FOLDER_FORMAT)
+    finally:
+        _RUN_STAMP = previous
+
+
+_RUN_FOLDER_FORMAT = "%Y-%m%d-%H%M%S"
 
 
 def _save_output(
@@ -131,32 +200,52 @@ def _save_output(
     mode: str,
     cost_usd: float | None = None,
     provenance: str | None = None,
+    model: str = AGENT_MODEL,
 ) -> Path:
     """Save output with timestamp. Returns the path.
 
     `provenance`, when given, is written verbatim to the sidecar file instead
     of the research agent's session log.
+
+    Inside a `vault_run` block the artifacts of one run share a folder and
+    drop the per-file timestamp:
+
+        <ticker>/20260822/2026-0822-070153/ACN-fundamental.md
+
+    Outside one — the standalone research CLI, which writes a single report —
+    the old flat layout is kept, timestamp in the filename.
     """
     if cost_usd is not None:
-        content = content.rstrip("\n") + f"\n\n---\n**LLM cost:** ${cost_usd:.4f} ({AGENT_MODEL})\n"
-    now = datetime.now()
-    date = now.strftime("%Y%m%d")
-    timestamp = now.strftime("%Y%m%d-%H%M%S")
-    if mode == "news":
-        filename = f"{ticker}-news-{timestamp}.md"
-        out_path = MEMO_DIR / ticker / filename
-    elif mode == "technical":
-        filename = f"{ticker}-technical-{timestamp}.md"
-        out_path = MEMO_DIR / ticker / date / filename
-    elif mode == "fundamentals":
-        filename = f"{ticker}-fundamental-{timestamp}.md"
-        out_path = MEMO_DIR / ticker / date / filename
-    elif mode in ("sentiment", "decision"):
-        filename = f"{ticker}-{mode}-{timestamp}.md"
-        out_path = MEMO_DIR / ticker / date / filename
+        content = content.rstrip("\n") + f"\n\n---\n**LLM cost:** ${cost_usd:.4f} ({model})\n"
+    # Inside a run, every path is derived from the instant the RUN started,
+    # not the instant this file happens to be written.
+    now = _RUN_STAMP or datetime.now()
+    stem = _MODE_STEMS.get(mode)
+    parent = MEMO_DIR / ticker
+    if mode in _DATED_MODES:
+        parent = parent / now.strftime("%Y%m%d")
+
+    if _RUN_STAMP is not None:
+        # One folder per run, so the timestamp is on the folder and not
+        # repeated on every file inside it.
+        parent = parent / now.strftime(_RUN_FOLDER_FORMAT)
+        filename = f"{ticker}-{stem}.md" if stem else f"{ticker}.md"
     else:
-        filename = f"{ticker}-{timestamp}.md"
-        out_path = MEMO_DIR / ticker / filename
+        timestamp = now.strftime("%Y%m%d-%H%M%S")
+        filename = (
+            f"{ticker}-{stem}-{timestamp}.md" if stem else f"{ticker}-{timestamp}.md"
+        )
+
+    out_path = parent / filename
+    if _RUN_STAMP is not None and out_path.exists():
+        # Two artifacts of the same kind in one run. Unreachable today —
+        # every mode is saved exactly once per run — so if it happens the
+        # honest answer is to say so rather than overwrite a report that
+        # cost real money to produce.
+        raise FileExistsError(
+            f"{out_path} already exists in this run's folder — a second "
+            f"'{mode}' artifact would overwrite the first. Nothing was written."
+        )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(content)
 
@@ -210,10 +299,17 @@ def _print_usage_summary(
     _trace(f"{'='*55}")
 
 
-def _compute_cost(usage: UsageSummary) -> float | None:
+def _compute_cost(usage: UsageSummary, model: str = AGENT_MODEL) -> float | None:
     """Estimate USD cost from token usage, or None if pricing isn't configured
-    for AGENT_MODEL."""
-    pricing = _MODEL_PRICING.get(AGENT_MODEL)
+    for `model`.
+
+    `model` defaults to AGENT_MODEL, which was correct by coincidence until
+    Phase 5: every earlier caller used the researcher's own model. A node
+    that calls a different model and does not pass it here gets a cost priced
+    at the wrong rate — understated 3x for Sonnet against Haiku — which is
+    exactly the kind of wrong number a per-run budget assertion would then
+    wave through."""
+    pricing = _MODEL_PRICING.get(model)
     if not pricing:
         return None
     return round(
@@ -225,16 +321,23 @@ def _compute_cost(usage: UsageSummary) -> float | None:
     )
 
 
-def log_cost(ticker: str, mode: str, usage: UsageSummary) -> float | None:
+def log_cost(
+    ticker: str, mode: str, usage: UsageSummary, model: str = AGENT_MODEL
+) -> float | None:
     """Append one JSON line to docs/cost-log.jsonl. Returns the estimated
     cost (or None if pricing isn't configured), so callers can also surface
-    it elsewhere (e.g. in the memo itself)."""
-    cost = _compute_cost(usage)
+    it elsewhere (e.g. in the memo itself).
+
+    Pass `model` whenever the call being logged did not use AGENT_MODEL. Both
+    the logged label and the price come from it — a hardcoded label on a
+    differently-priced call produces a log that is wrong twice and looks
+    right."""
+    cost = _compute_cost(usage, model)
     entry = {
         "timestamp": datetime.now().isoformat(),
         "ticker": ticker,
         "mode": mode,
-        "model": AGENT_MODEL,
+        "model": model,
         "input_tokens": usage.input_tokens,
         "cache_write_tokens": usage.cache_write_tokens,
         "cache_read_tokens": usage.cache_read_tokens,

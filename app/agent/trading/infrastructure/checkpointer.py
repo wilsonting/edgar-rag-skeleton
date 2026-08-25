@@ -38,6 +38,23 @@ ALLOWED_MSGPACK_MODULES = [
     ("app.agent.trading.domain.news_digest", "NewsItem"),
     ("app.agent.trading.domain.news_digest", "NewsDigest"),
     ("app.agent.trading.domain.news_digest", "SentimentSummary"),
+    # Phase 5. Three entries for one channel because DebateTurn nests
+    # DebateTurnPayload nests DebateClaim, and an unregistered type fails on
+    # DESERIALIZATION ONLY — a live run stays green and the resume goes red,
+    # which is the worst possible place to discover a missing line.
+    ("app.agent.trading.domain.debate", "DebateClaim"),
+    ("app.agent.trading.domain.debate", "DebateTurnPayload"),
+    ("app.agent.trading.domain.debate", "DebateTurn"),
+    # Phase 6. Three entries, same reason as the debate ones above: RiskTurn
+    # nests RiskTurnPayload nests RiskFactor/RiskScore, and a missing entry
+    # fails on DESERIALIZATION ONLY. RiskLedgerEntry is deliberately absent —
+    # it never enters state (domain/risk.py's docstring on why) — so if it is
+    # ever persisted, that line belongs in the same commit as the change that
+    # persists it, not here.
+    ("app.agent.trading.domain.risk", "RiskFactor"),
+    ("app.agent.trading.domain.risk", "RiskScore"),
+    ("app.agent.trading.domain.risk", "RiskTurnPayload"),
+    ("app.agent.trading.domain.risk", "RiskTurn"),
 ]
 
 
