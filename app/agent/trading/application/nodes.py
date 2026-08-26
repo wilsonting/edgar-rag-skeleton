@@ -10,13 +10,18 @@ same split as the risk/debate ports vs. their nodes.
 from collections import Counter
 from datetime import date
 
+from anthropic import AsyncAnthropic
+
 from app.agent.trading.application.risk_ledger import build_risk_ledger
+from app.agent.trading.application.risk_router import RISK_MAX_TURNS
+from app.agent.trading.domain.decision_memo import Verdict
 from app.agent.trading.domain.news_digest import (
     AGGREGATED_RELEVANCE,
     NewsDigest,
     NewsItem,
     SentimentSummary,
 )
+from app.agent.trading.domain.risk import PERSONAS
 from app.agent.trading.domain.technical_report import TechnicalReport
 from app.agent.trading.domain.trading_state import TradingState
 from app.agent.trading.infrastructure.fundamentals_port import get_fundamentals_report
@@ -26,6 +31,18 @@ from app.agent.trading.infrastructure.price_data_port import get_price_history
 from app.agent.trading.application.technical_indicators import compute_indicators
 from app.agent.trading.infrastructure.synthesis_port import run_synthesis
 from app.agent.trading.infrastructure.technical_interpreter_port import interpret_indicators, save_technical_report
+
+# Phase 6 exit-criteria fix (2026-08-26, code review): post-fix measurement
+# on two tickers (AVGO, ASML) showed the risk panel's verdict genuinely
+# splits direction across independent samples of the SAME fixed debate —
+# not an identity artifact (slate-identity and threshold-brittleness fixes
+# both landed first; the split persisted). A fixed-ledger repeat of the
+# Risk Judge alone (3 calls against one frozen ledger, AVGO) came back
+# unanimous, which localizes the variance to the PANEL, not the Judge — so
+# sampling has to re-run the whole (panel, Research Manager, Risk Judge)
+# trial, not just resample the Judge's call. See
+# trading-agent-known-gaps.md for the measurements this decision rests on.
+RISK_VERDICT_SAMPLES = 3
 
 
 async def fundamentals_node(state: TradingState) -> dict:
@@ -389,6 +406,35 @@ def _risk_caveats(state: TradingState) -> tuple[list[str], list[str], list]:
     return gaps, evidence, ledger
 
 
+async def _sample_additional_risk_panel(state: TradingState) -> list:
+    """One fresh 9-turn risk panel over the SAME fixed debate/technical
+    context already in `state`, independent of `state["risk_turns"]` — a
+    second (or third) vote for `synthesizer_node`'s majority-of-N sampling,
+    not a resume of the graph-checkpointed panel. Drives `risk_nodes.
+    _risk_turn` directly (same validation as a real graph turn: rotation,
+    ordering, stale-checkpoint checks) rather than calling
+    `risk_port.run_risk_turn` here directly, so this goes through the same
+    module attribute tests already monkeypatch
+    (`risk_nodes.run_risk_turn`) — calling the port function straight from
+    this module would silently bypass that seam and hit the network in
+    every existing synthesizer_node test that populates `risk_turns`.
+    Deliberately NOT checkpointed per-turn like the graph's own panel is —
+    these extra samples live and die inside this one synthesizer node call,
+    same resumability granularity `run_synthesis` already had before this
+    change."""
+    # Local import: risk_nodes -> risk_port -> debate_port -> nodes (for
+    # ANALYST_OUTPUTS) is a real cycle at module-load time — same reason
+    # every debate_port import inside synthesis_port.py is function-local.
+    import app.agent.trading.application.risk_nodes as risk_nodes
+
+    turns: list = []
+    for i in range(RISK_MAX_TURNS):
+        persona = PERSONAS[i % len(PERSONAS)]
+        result = await risk_nodes._risk_turn({**state, "risk_turns": turns}, persona)
+        turns.append(result["risk_turns"][0])
+    return turns
+
+
 async def synthesizer_node(state: TradingState) -> dict:
     print(f"[synthesizer] running for {state['ticker']}")
     as_of = state.get("as_of_date")
@@ -424,4 +470,46 @@ async def synthesizer_node(state: TradingState) -> dict:
     memo = await run_synthesis(
         state, ledger=ledger, base_gaps=base_gaps, base_evidence=base_evidence, as_of=as_of
     )
-    return {"decision_memo": memo}
+
+    if not ledger:
+        # No risk panel ran (e.g. `--only technical`) — nothing to sample,
+        # same single-call behavior as before this change. `verdict_samples`
+        # stays its default empty list, which is the honest signal that
+        # sampling did not run, not that it ran and produced one entry.
+        return {"decision_memo": memo}
+
+    memos = [memo]
+    client = AsyncAnthropic()
+    for _ in range(RISK_VERDICT_SAMPLES - 1):
+        sample_turns = await _sample_additional_risk_panel(state)
+        sample_ledger = build_risk_ledger(sample_turns)
+        sample_state = {**state, "risk_turns": sample_turns}
+        memos.append(await run_synthesis(
+            sample_state, ledger=sample_ledger, base_gaps=base_gaps,
+            base_evidence=base_evidence, as_of=as_of, client=client,
+        ))
+
+    verdicts = [m.verdict.value for m in memos]
+    top_verdict, top_count = Counter(verdicts).most_common(1)[0]
+    has_majority = top_count > len(memos) / 2
+
+    if has_majority:
+        # Reuse the first sample whose OWN verdict agrees with the
+        # majority, so the memo's narrative and its verdict label are
+        # never inconsistent with each other (a memo arguing `sell` should
+        # never be labeled `hold` because sample 1 happened to say `hold`
+        # while 2 and 3 said `sell`).
+        final = next(m for m in memos if m.verdict.value == top_verdict)
+        split_note = f"risk verdict sampled N={len(memos)}: {verdicts} — majority {top_verdict}"
+    else:
+        final = memos[0].model_copy(update={"verdict": Verdict.UNRESOLVED})
+        split_note = (
+            f"risk verdict sampled N={len(memos)}: {verdicts} — no majority, "
+            f"reported as UNRESOLVED rather than picking one sample's answer"
+        )
+
+    final = final.model_copy(update={
+        "verdict_samples": verdicts,
+        "data_gaps": final.data_gaps + [split_note],
+    })
+    return {"decision_memo": final}

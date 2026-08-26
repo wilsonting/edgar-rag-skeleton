@@ -20,7 +20,8 @@ from __future__ import annotations
 
 from app.agent.trading.domain.risk import PERSONAS, RiskLedgerEntry, RiskTurn
 
-CONTESTED_THRESHOLD = 2  # either spread >= this marks the factor contested
+CONTESTED_THRESHOLD = 2  # either spread >= this marks the factor contested (display only)
+MAX_SPREAD = 4           # severity/likelihood each range 1-5; widest possible spread
 
 
 def build_slate(turns: list[RiskTurn]) -> list[str]:
@@ -52,12 +53,31 @@ def build_risk_ledger(risk_turns: list[RiskTurn]) -> list[RiskLedgerEntry]:
                 proposed_by=turn.persona,
             )
 
+        # `scored_this_turn` is reset every turn, deliberately separate from
+        # `entry.scores` (which persists across ALL turns): those two sets
+        # answer different questions. A duplicate factor_id in ONE turn's
+        # own `scores` list (a model error — the schema doesn't forbid it)
+        # should keep the first and drop the second. A LATER turn revising
+        # a score it already gave in an EARLIER turn is not a duplicate —
+        # it is the "respond"/re-adjudicate phase working as designed
+        # (risk_port.py's turn_phase), and must overwrite, not be dropped.
+        #
+        # Found live (2026-08-25, code review): checking `turn.persona in
+        # entry.scores` — persisted state, not turn-local — meant every
+        # persona's FIRST score for a factor was permanent. The whole
+        # adjudicate/respond cycle (turns 3-5, and now 6-8 for round 3)
+        # still ran, still argued, still submitted revised numbers, and the
+        # ledger silently kept round 1's numbers forever. `contested` was
+        # then computed from stances that were never actually the personas'
+        # final position.
+        scored_this_turn: set[str] = set()
         for score in turn.payload.scores:
             entry = entries.get(score.factor_id)
             if entry is None:
                 continue  # unknown_factor_id — flagged at the turn level, dropped here
-            if turn.persona in entry.scores:
-                continue  # duplicate score for one factor in one turn — first wins
+            if score.factor_id in scored_this_turn:
+                continue  # duplicate score for one factor in ONE turn — first wins
+            scored_this_turn.add(score.factor_id)
             entry.scores[turn.persona] = (score.severity, score.likelihood)
 
     for factor_id in order:
@@ -72,6 +92,15 @@ def build_risk_ledger(risk_turns: list[RiskTurn]) -> list[RiskLedgerEntry]:
                 entry.severity_spread >= CONTESTED_THRESHOLD
                 or entry.likelihood_spread >= CONTESTED_THRESHOLD
             )
+            # MAX_SPREAD=4: severity/likelihood each range 1-5, so the
+            # widest possible disagreement on either axis is 4. Averaging
+            # the two axes before normalizing (rather than normalizing each
+            # and taking the max) means a factor split on BOTH axes reads
+            # as more contested than one split on only one — a real
+            # distinction `contested`'s OR-of-two-booleans throws away.
+            entry.normalized_spread = (
+                (entry.severity_spread + entry.likelihood_spread) / 2
+            ) / MAX_SPREAD
 
     return [entries[fid] for fid in order]
 

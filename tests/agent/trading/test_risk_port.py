@@ -95,8 +95,15 @@ def _no_cost_log(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# factor_id is Python-assigned, unconditionally
+# factor_id is Python-assigned, content-addressed — NOT positional
 # ---------------------------------------------------------------------------
+#
+# Positional ids (f"RF{i:02d}") were the original design and are gone: found
+# live (2026-08-26, code review) that two temperature=0 replays of the
+# IDENTICAL prompt produced enumerations that differed in count and had the
+# same underlying concepts under swapped positional ids — "Python owns
+# identity" was true of the label, not of what the label pointed at. See
+# risk_port._content_id's docstring for the full finding.
 
 @pytest.mark.anyio
 async def test_enumeration_turn_gets_python_assigned_ids_regardless_of_what_the_model_sent():
@@ -110,15 +117,57 @@ async def test_enumeration_turn_gets_python_assigned_ids_regardless_of_what_the_
 
     turn = await port.run_risk_turn(_state(), "neutral", 0, client=client)
 
-    assert [f.factor_id for f in turn.payload.proposes] == ["RF00", "RF01"]
+    ids = [f.factor_id for f in turn.payload.proposes]
+    assert all(fid.startswith("RF") and fid != "whatever-i-felt-like" and fid != "" for fid in ids)
+    assert len(set(ids)) == 2   # distinct factors get distinct ids
 
 
 @pytest.mark.anyio
-async def test_ids_continue_from_the_existing_slate_length():
+async def test_the_same_factor_text_gets_the_same_id_across_independent_calls():
+    """The actual property the content-addressed scheme exists to
+    guarantee: identity survives a replay, which a positional counter
+    never could — this is the direct regression test for the live finding."""
+    payload_a = _turn_payload(proposes=[_factor_payload(text="Price breaks below the 200-day moving average")])
+    payload_b = _turn_payload(proposes=[_factor_payload(text="Price breaks below the 200-day moving average")])
+
+    turn_a = await port.run_risk_turn(_state(), "neutral", 0, client=_FakeClient([payload_a]))
+    turn_b = await port.run_risk_turn(_state(), "neutral", 0, client=_FakeClient([payload_b]))
+
+    assert turn_a.payload.proposes[0].factor_id == turn_b.payload.proposes[0].factor_id
+
+
+@pytest.mark.anyio
+async def test_wording_and_case_differences_still_hash_to_the_same_id():
+    payload_a = _turn_payload(proposes=[_factor_payload(text="RSI falls below 30")])
+    payload_b = _turn_payload(proposes=[_factor_payload(text="  RSI Falls Below 30!!  ")])
+
+    turn_a = await port.run_risk_turn(_state(), "neutral", 0, client=_FakeClient([payload_a]))
+    turn_b = await port.run_risk_turn(_state(), "neutral", 0, client=_FakeClient([payload_b]))
+
+    assert turn_a.payload.proposes[0].factor_id == turn_b.payload.proposes[0].factor_id
+
+
+@pytest.mark.anyio
+async def test_different_factor_text_gets_different_ids():
+    payload = _turn_payload(proposes=[
+        _factor_payload(text="RSI falls below 30"),
+        _factor_payload(text="Price breaks below the 200-day moving average"),
+    ])
+    client = _FakeClient([payload])
+
+    turn = await port.run_risk_turn(_state(), "neutral", 0, client=client)
+
+    ids = [f.factor_id for f in turn.payload.proposes]
+    assert len(set(ids)) == 2
+
+
+@pytest.mark.anyio
+async def test_a_new_factor_does_not_collide_with_an_id_already_on_the_slate():
     prior = RiskTurn(
         turn_index=0, round_num=1, persona="neutral",
         payload=RiskTurnPayload(
-            argument="a", proposes=[RiskFactor(factor_id="RF00", text="x", trigger="closes below 100", horizon="weeks", evidence_ref="none")],
+            proposes=[RiskFactor(factor_id="RFAAAA", text="x", trigger="closes below 100", horizon="weeks", evidence_ref="none")],
+            argument="a",
         ),
     )
     payload = _turn_payload(proposes=[_factor_payload(text="new one")])
@@ -126,7 +175,9 @@ async def test_ids_continue_from_the_existing_slate_length():
 
     turn = await port.run_risk_turn(_state(risk_turns=[prior]), "aggressive", 1, client=client)
 
-    assert [f.factor_id for f in turn.payload.proposes] == ["RF01"]
+    new_id = turn.payload.proposes[0].factor_id
+    assert new_id.startswith("RF")
+    assert new_id != "RFAAAA"
 
 
 # ---------------------------------------------------------------------------
@@ -332,3 +383,47 @@ async def test_a_number_from_an_earlier_risk_turns_own_score_is_not_flagged():
     turn = await port.run_risk_turn(_state(risk_turns=[prior, scored]), "conservative", 2, client=client)
 
     assert not any("unbacked_number: 2" in f for f in turn.guard_flags)
+
+
+# ---------------------------------------------------------------------------
+# turn_phase generalizes over RISK_MAX_ROUNDS (Phase 6 gap closure: 2 -> 3
+# rounds) rather than being hardcoded to a fixed 6-turn shape
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "turn_index,expected",
+    [
+        (0, "enumerate"),
+        (1, "score"), (2, "score"),
+        (3, "adjudicate"), (4, "respond"), (5, "respond"),
+        (6, "adjudicate"), (7, "respond"), (8, "respond"),
+    ],
+)
+def test_turn_phase_over_three_rounds(turn_index, expected):
+    assert port.turn_phase(turn_index) == expected
+
+
+# ---------------------------------------------------------------------------
+# Temperature plumbing — the determinism/stability check needs this
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_production_calls_omit_temperature_by_default():
+    payload = _turn_payload()
+    client = _FakeClient([payload])
+
+    await port.run_risk_turn(_state(), "neutral", 0, client=client)
+
+    assert "temperature" not in client.messages.calls[0]
+
+
+@pytest.mark.anyio
+async def test_an_explicit_temperature_is_sent_and_disables_thinking():
+    payload = _turn_payload()
+    client = _FakeClient([payload])
+
+    await port.run_risk_turn(_state(), "neutral", 0, client=client, temperature=0.0)
+
+    call = client.messages.calls[0]
+    assert call["temperature"] == 0.0
+    assert "thinking" not in call

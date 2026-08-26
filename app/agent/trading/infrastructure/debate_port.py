@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, BadRequestError
 from pydantic import ValidationError
 
 from app.agent.researcher import (
@@ -114,6 +114,67 @@ _ADAPTIVE_THINKING_MODELS = (
 
 def supports_adaptive_thinking(model: str) -> bool:
     return model.startswith(_ADAPTIVE_THINKING_MODELS)
+
+
+def reasoning_config(model: str, temperature: float | None) -> dict:
+    """The `thinking`/`output_config`/`temperature` kwargs for one call.
+
+    Production (`temperature=None`, the default everywhere this is called):
+    unchanged behavior — adaptive thinking on for the models that support it,
+    no explicit `temperature` sent at all.
+
+    An EXPLICIT temperature (Phase 6's determinism/stability checks, which
+    need `temperature=0` and a fixed low temperature respectively) disables
+    thinking outright, on every model, regardless of the value requested.
+    Extended/adaptive thinking requires the API's default temperature and
+    rejects an explicit one alongside it — sending both is a 400, and a
+    reproducibility check that intermittently 400s on the very call it is
+    trying to make deterministic is worse than no check. Determinism claims
+    about the *thinking-enabled* production path are therefore a
+    correlational claim of "this held with thinking off", not a proof that
+    holds with it on — recorded in the finding, not hidden by it.
+    """
+    if temperature is not None:
+        return {"temperature": temperature}
+    if supports_adaptive_thinking(model):
+        return {"thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}}
+    return {}
+
+
+async def create_with_temperature_fallback(client: AsyncAnthropic, **kwargs):
+    """`client.messages.create(**kwargs)`, but if the model rejects
+    `temperature` outright, retry once without it.
+
+    Found live (2026-08-25, running the Phase 6 determinism check against
+    claude-sonnet-5 as Risk Judge/Research Manager): `temperature=0.0` 400s
+    with "temperature is deprecated for this model" — not merely ignored,
+    REJECTED. Haiku 4.5 (this project's RISK_MODEL) accepted the identical
+    parameter on the same run; whether a given model still honors
+    `temperature` is therefore a live API fact, not something safe to
+    special-case from a hardcoded model list that goes stale the moment a
+    new model ships.
+
+    Reacting to the API's own error is the general fix, but it changes what
+    a determinism/stability claim MEANS for a model like this: there is no
+    lever left to set, so "replayed at temperature=0" silently becomes
+    "replayed at whatever this model's fixed default is" — printed loudly
+    here specifically so that distinction is never silently absorbed into a
+    passing check.
+    """
+    try:
+        return await client.messages.create(**kwargs)
+    except BadRequestError as e:
+        message = str(e).lower()
+        if "temperature" in kwargs and "temperature" in message and "deprecated" in message:
+            print(
+                f"[reasoning_config] {kwargs.get('model')} rejects `temperature` "
+                f"(deprecated for this model) — retrying without it. Any "
+                f"determinism/stability claim for this call no longer rests on a "
+                f"temperature lever, only on the model's own fixed default."
+            )
+            kwargs = {k: v for k, v in kwargs.items() if k != "temperature"}
+            return await client.messages.create(**kwargs)
+        raise
 
 
 if DEBATE_MODEL not in _MODEL_PRICING:

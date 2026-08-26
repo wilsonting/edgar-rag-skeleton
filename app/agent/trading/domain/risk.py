@@ -46,7 +46,7 @@ def _normalize_blank(value: object) -> object:
 
 class RiskFactor(BaseModel):
     """A candidate risk. Proposed by the LLM as text; `factor_id` is
-    Python-assigned in `risk_nodes._assemble` — never trust one on the wire."""
+    Python-assigned in `risk_port._assemble` — never trust one on the wire."""
 
     # default="unassigned", not "" — asking a Claude tool call for a literal
     # empty string is unreliable (it writes a stray parameter-close marker
@@ -97,9 +97,27 @@ class RiskScore(BaseModel):
 
 
 class RiskTurnPayload(BaseModel):
-    """EXACTLY what the LLM returns. No ids it owns, no counters, no persona."""
+    """EXACTLY what the LLM returns. No ids it owns, no counters, no persona.
 
-    argument: str = Field(description="<=180 words.")
+    Field order is deliberate, not alphabetical or "natural": `proposes`
+    and `scores` come BEFORE `argument`. Strict structured output fills
+    fields in schema-declaration order, autoregressively — with `argument`
+    first (as this was originally written), every score is sampled
+    CONDITIONED ON ~180 freshly-generated words of prose that themselves
+    have no `temperature=0` guarantee. Found live (2026-08-26, code review
+    + `scripts/risk_determinism_check.py` on AVGO/ASML): the numeric
+    severity/likelihood fields turned out to be reliably reproducible in
+    isolation, but not once they follow a large free-text field in the same
+    turn — that's a mechanical consequence of autoregressive sampling, not
+    a property of the numbers themselves. Moving `argument` last means the
+    structured numbers are sampled first and the prose becomes a summary of
+    an already-fixed answer, not the thing the answer is conditioned on.
+    Nothing is lost for reasoning quality specifically: adaptive thinking
+    (see infrastructure/risk_port.py) already runs a private reasoning pass
+    before ANY of these fields are generated, `argument` included — it was
+    never the model's real chain of thought, just the transcript's.
+    """
+
     proposes: list[RiskFactor] = Field(
         default_factory=list,
         description="Enumeration turn: 3-7. Scoring turns: 0 or 1. Adjudication: 0.",
@@ -113,6 +131,7 @@ class RiskTurnPayload(BaseModel):
             "string 'none' on the enumeration and adjudication turns."
         ),
     )
+    argument: str = Field(description="<=180 words. Written LAST — see class docstring.")
 
     _blank = field_validator("accept_condition", mode="before")(
         lambda v: _normalize_blank(v)
@@ -159,5 +178,20 @@ class RiskLedgerEntry(BaseModel):
     scores: dict[Persona, tuple[int, int]] = Field(default_factory=dict)
     severity_spread: int = 0        # max - min across present severity scores
     likelihood_spread: int = 0      # max - min across present likelihood scores
-    contested: bool = False         # either spread >= 2
+    # `contested` (spread >= 2) is a DISPLAY flag only as of the fix below —
+    # never feed it into a computation. A hard integer threshold on a 1-5
+    # scale with three raters turns a plain ±1 drift into a boolean flip
+    # for any factor already sitting at spread 1, which is most of them;
+    # §8.3's confidence term used to read that flip as a measurement. Found
+    # live (2026-08-26, code review): the same ±1-scale drift that DOESN'T
+    # cross this threshold is exactly what temperature=0 non-determinism
+    # produces even once the factor-identity bug (see risk_port._assemble)
+    # is fixed, so a downstream computation built on this boolean inherits
+    # a cliff where the underlying signal is continuous.
+    contested: bool = False         # either spread >= 2 — DISPLAY ONLY, see above
+    # The continuous replacement: mean of (severity_spread, likelihood_spread)
+    # normalized by the maximum possible spread on a 1-5 scale (4), so a
+    # single point of drift moves this by at most 0.125 rather than
+    # flipping a category. This is what compute_confidence reads.
+    normalized_spread: float = 0.0
     missing_scores: list[Persona] = Field(default_factory=list)

@@ -177,3 +177,44 @@ def test_contested_ids_returns_only_spread_at_or_above_threshold_in_slate_order(
 def test_empty_transcript_produces_an_empty_ledger():
     assert build_risk_ledger([]) == []
     assert contested_ids([]) == []
+
+
+def test_a_later_turns_revised_score_overwrites_the_earlier_one_from_the_same_persona():
+    """The bug this guards: `entries[...].scores` persists across the whole
+    turn loop, so a naive "has this persona already scored this factor"
+    check (keyed on the SAME condition used for within-turn duplicates)
+    would treat round 2's revision as a duplicate of round 1's score and
+    silently drop it — defeating the entire adjudicate/respond convergence
+    mechanism. A LATER turn must win, not the first."""
+    turns = [
+        _turn(0, "neutral", proposes=[_factor("RF00")]),
+        _turn(1, "aggressive", scores=[RiskScore(factor_id="RF00", severity=5, likelihood=5, rationale="round 1")]),
+        _turn(2, "conservative", scores=[RiskScore(factor_id="RF00", severity=1, likelihood=1, rationale="round 1")]),
+        _turn(3, "neutral", scores=[RiskScore(factor_id="RF00", severity=3, likelihood=3, rationale="adjudicated")]),
+        # aggressive REVISES its round-1 score in the "respond" phase
+        _turn(4, "aggressive", scores=[RiskScore(factor_id="RF00", severity=2, likelihood=2, rationale="revised down")]),
+    ]
+
+    ledger = build_risk_ledger(turns)
+
+    entry = ledger[0]
+    assert entry.scores["aggressive"] == (2, 2)   # NOT (5, 5) — the revision must win
+    assert entry.scores["conservative"] == (1, 1)  # unrevised, still round 1
+    assert entry.scores["neutral"] == (3, 3)
+
+
+def test_a_persona_re_adjudicating_in_round_3_overwrites_its_round_2_score():
+    """Same mechanism, one round further: neutral's turn-6 re-adjudication
+    of a still-contested factor must overwrite its own turn-3 verdict, not
+    be dropped as a 'duplicate'."""
+    turns = [
+        _turn(0, "neutral", proposes=[_factor("RF00")]),
+        _turn(1, "aggressive", scores=[RiskScore(factor_id="RF00", severity=5, likelihood=5, rationale="r")]),
+        _turn(2, "conservative", scores=[RiskScore(factor_id="RF00", severity=1, likelihood=1, rationale="r")]),
+        _turn(3, "neutral", scores=[RiskScore(factor_id="RF00", severity=3, likelihood=3, rationale="first read")]),
+        _turn(6, "neutral", scores=[RiskScore(factor_id="RF00", severity=4, likelihood=4, rationale="revised read")]),
+    ]
+
+    ledger = build_risk_ledger(turns)
+
+    assert ledger[0].scores["neutral"] == (4, 4)

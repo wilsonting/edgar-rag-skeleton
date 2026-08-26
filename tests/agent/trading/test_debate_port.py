@@ -1173,3 +1173,86 @@ async def test_the_running_debate_cost_is_asserted_against_the_budget(monkeypatc
         await port.run_debate_turn(
             _state(debate_turns=turns), "bear", 1, client=client
         )
+
+
+# ---------------------------------------------------------------------------
+# create_with_temperature_fallback — Phase 6 gap closure. Found live
+# (2026-08-25): claude-sonnet-5 400s on an explicit `temperature`
+# ("temperature is deprecated for this model"), while Haiku 4.5 accepts the
+# identical parameter. The fallback must retry once without it, not raise.
+# ---------------------------------------------------------------------------
+
+import httpx
+from anthropic import BadRequestError
+
+
+def _bad_request(message: str) -> BadRequestError:
+    response = httpx.Response(
+        400, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    )
+    return BadRequestError(message, response=response, body={"error": {"message": message}})
+
+
+class _FlakyThenOkMessages:
+    """Raises once on the FIRST call (simulating a model that rejects
+    `temperature`), then succeeds — and records every call's kwargs so the
+    test can assert the retry actually dropped `temperature`."""
+
+    def __init__(self, error: Exception, ok_payload: dict):
+        self._error = error
+        self._ok_payload = ok_payload
+        self.calls: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            raise self._error
+        return _Response(self._ok_payload)
+
+
+class _FlakyClient:
+    def __init__(self, error: Exception, ok_payload: dict):
+        self.messages = _FlakyThenOkMessages(error, ok_payload)
+
+
+@pytest.mark.anyio
+async def test_temperature_deprecated_error_retries_without_temperature():
+    error = _bad_request("temperature: is deprecated for this model")
+    client = _FlakyClient(error, _payload())
+
+    response = await port.create_with_temperature_fallback(
+        client, model="claude-sonnet-5", max_tokens=100, temperature=0.0,
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert response is not None
+    assert len(client.messages.calls) == 2
+    assert client.messages.calls[0]["temperature"] == 0.0
+    assert "temperature" not in client.messages.calls[1]
+
+
+@pytest.mark.anyio
+async def test_an_unrelated_bad_request_error_is_not_swallowed():
+    error = _bad_request("some other validation problem")
+    client = _FlakyClient(error, _payload())
+
+    with pytest.raises(BadRequestError, match="some other validation problem"):
+        await port.create_with_temperature_fallback(
+            client, model="claude-sonnet-5", max_tokens=100, temperature=0.0,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+
+@pytest.mark.anyio
+async def test_the_fallback_is_a_noop_when_temperature_was_never_sent():
+    """No `temperature` kwarg at all — an unrelated 400 with the word
+    'temperature' in its message must still propagate, not be treated as
+    the deprecation case; there is nothing to retry without."""
+    error = _bad_request("temperature must be between 0 and 1, deprecated range")
+    client = _FlakyClient(error, _payload())
+
+    with pytest.raises(BadRequestError):
+        await port.create_with_temperature_fallback(
+            client, model="claude-sonnet-5", max_tokens=100,
+            messages=[{"role": "user", "content": "hi"}],
+        )

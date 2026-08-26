@@ -84,6 +84,7 @@ def _memo() -> DecisionMemo:
         ticker="ACN",
         bull_case="STUB",
         bear_case="STUB",
+        research_thesis="STUB",
         risk_debate_summary="STUB",
         technical_signal="Momentum is soft.",
         reasoning="STUB",

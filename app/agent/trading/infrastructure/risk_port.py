@@ -10,18 +10,19 @@ exists at all: `RiskFactor.factor_id` is Python-assigned, never model-
 authored. Phase 5 measured 145 claims across five full debates with 145
 distinct `claim_id`s — the model was never once asked to reuse an id and
 never did it unprompted (docs/phase6-gate-a-findings.md). A ledger where
-three personas score the SAME factor across two rounds needs the opposite of
-that, so here the model proposes factor TEXT only and Python assigns the id
-that everything downstream keys on.
+three personas score the SAME factor across multiple rounds needs the
+opposite of that, so here the model proposes factor TEXT only and Python
+assigns the id that everything downstream keys on.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 from anthropic import AsyncAnthropic
 from pydantic import ValidationError
@@ -48,9 +49,10 @@ from app.agent.trading.infrastructure.debate_port import (
     _flag_debate_numbers,
     _inline_refs,
     _norm,
+    create_with_temperature_fallback,
+    reasoning_config,
     render_transcript as render_debate_transcript,
     report_texts,
-    supports_adaptive_thinking,
 )
 
 Phase = Literal["enumerate", "score", "adjudicate", "respond"]
@@ -60,16 +62,12 @@ RISK_MODEL = os.getenv("TRADING_RISK_MODEL") or AGENT_MODEL
 
 RISK_MAX_TOKENS = 4000
 
-# Whole-panel ceiling, not per turn. Phase 6 plan §10 estimates $0.09-0.12
-# for a 6-turn panel by analogy with Phase 5's measured debate cost
-# ($0.077-0.094 for 6 turns of comparable pack size) — that estimate is
-# unverified against a live run as of this write-up; re-measure and correct
-# this constant once one exists, the same way DEBATE_BUDGET_USD's docstring
-# records what was actually measured rather than only what was projected.
-RISK_BUDGET_USD = 0.20
-
-RISK_THINKING: dict[str, Any] = {"type": "adaptive"}
-RISK_EFFORT = "low"
+# Whole-panel ceiling. Measured live (MSFT, 2026-08-25, Haiku 4.5, 6-turn
+# 2-round panel): $0.0697-$0.0704. Raised with the round count (2 -> 3,
+# Phase 6 gap-closure) since a 9-turn panel costs proportionally more; kept
+# with real margin above the measured 6-turn figure rather than tight
+# against a linear extrapolation.
+RISK_BUDGET_USD = 0.35
 
 if RISK_MODEL not in _MODEL_PRICING:
     print(
@@ -97,14 +95,20 @@ def turn_phase(turn_index: int) -> Phase:
     place this mapping is written down — risk_nodes, the prompt builder and
     the guard checks all read through this rather than each re-deriving it
     from turn_index % 3 // whatever, which is exactly the kind of duplicated
-    arithmetic that drifts apart under a later edit."""
+    arithmetic that drifts apart under a later edit.
+
+    Generalized over RISK_MAX_ROUNDS rather than hardcoded to 2 rounds: round
+    1 is always enumerate (neutral) + score (aggressive, conservative); every
+    round after that is adjudicate (neutral, re-adjudicating whatever is
+    STILL contested after the previous round) + respond (aggressive,
+    conservative) — so a 3rd round is a second full adjudicate/respond cycle
+    over the ledger's current contested set, not a new phase name."""
     if turn_index == 0:
         return "enumerate"
     if turn_index in (1, 2):
         return "score"
-    if turn_index == 3:
-        return "adjudicate"
-    return "respond"   # 4, 5
+    position_in_round = turn_index % len(PERSONAS)   # 0=neutral, 1=aggressive, 2=conservative
+    return "adjudicate" if position_in_round == 0 else "respond"
 
 
 # ---------------------------------------------------------------------------
@@ -376,16 +380,15 @@ def _check_turn(
 # The call
 # ---------------------------------------------------------------------------
 
-async def _submit(client: AsyncAnthropic, system_blocks: list[dict], messages: list[dict]):
-    reasoning: dict[str, Any] = {}
-    if supports_adaptive_thinking(RISK_MODEL):
-        reasoning["thinking"] = RISK_THINKING
-        reasoning["output_config"] = {"effort": RISK_EFFORT}
-
-    return await client.messages.create(
+async def _submit(
+    client: AsyncAnthropic, system_blocks: list[dict], messages: list[dict],
+    temperature: float | None = None,
+):
+    return await create_with_temperature_fallback(
+        client,
         model=RISK_MODEL,
         max_tokens=RISK_MAX_TOKENS,
-        **reasoning,
+        **reasoning_config(RISK_MODEL, temperature),
         system=system_blocks,
         messages=messages,
         tools=[RISK_SUBMIT_TOOL],
@@ -449,6 +452,66 @@ def _assert_within_budget(ticker: str, turns: list[RiskTurn], this_turn: float |
         )
 
 
+_NORMALIZE_NONWORD = re.compile(r"[^\w\s]")
+_NORMALIZE_SPACE = re.compile(r"\s+")
+
+
+def _normalize_factor_text(text: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace — the same
+    concept phrased with different capitalization or a trailing period
+    still hashes identically. Not fuzzy: "export-control exposure" and
+    "export control risk" are different strings after normalization and
+    get different ids, on purpose — see `_content_id`'s docstring."""
+    return _NORMALIZE_SPACE.sub(" ", _NORMALIZE_NONWORD.sub("", text.lower())).strip()
+
+
+def _content_id(text: str, taken: set[str]) -> str:
+    """factor_id = content hash of the (normalized) factor text, not a
+    position in the enumeration.
+
+    Found live (2026-08-26, code review + a diagnostic run correlated to
+    the exact replay pair it was explaining): `f"RF{i:02d}"` bound
+    identity to ENUMERATION ORDER, which the model does not hold fixed —
+    two temperature=0 replays of the identical prompt produced factor
+    lists that differed in count (5 vs 6) AND had the same underlying
+    concepts under swapped positional ids (RF01 was "MACD deterioration"
+    in one replay, "50-day/200-day crossover" in the other). Every
+    downstream comparison (ledger diffs, contested-set stability,
+    determinism checks) was silently comparing scores attached to
+    DIFFERENT real-world risks under a shared label. Python was assigning
+    a position, not an identity — the guide's original framing ("Python
+    owns identity") was correct in intent and wrong in implementation.
+
+    A content hash fixes the part that's fixable in code: the SAME
+    proposed text gets the SAME id regardless of where in the list it
+    landed or which replay produced it. It does NOT fix, and cannot fix,
+    the model proposing a genuinely different set of risks between
+    replays (the 5-vs-6 case above) — that's enumeration variance, a
+    property of the free-text generation itself, not an identity bug. A
+    closed taxonomy (Python owns the categories, the model only supplies
+    per-ticker materiality and trigger) would close that gap too, at
+    higher cost; not attempted here. Near-duplicate wording ("export
+    control exposure" vs "export-control risk") still hashes differently
+    and is a known, accepted gap of this fix specifically — it makes
+    replay diffs interpretable (same content -> visibly same id) more than
+    it guarantees convergence on paraphrase.
+
+    Collision handling: 4 hex chars is 65,536 buckets for a slate that
+    never exceeds ~13 factors (enumerate cap 7 + up to 1 new per scoring
+    turn x 6 scoring turns), so a true hash collision is not the expected
+    failure mode — but two DIFFERENT factors normalizing to the exact same
+    string would collide by construction, so `taken` is checked and a
+    numeric suffix appended rather than trusting the hash space size.
+    """
+    digest = hashlib.sha1(_normalize_factor_text(text).encode()).hexdigest()[:4].upper()
+    candidate = f"RF{digest}"
+    suffix = 0
+    while candidate in taken:
+        suffix += 1
+        candidate = f"RF{digest}{suffix}"
+    return candidate
+
+
 def _assemble(
     payload: RiskTurnPayload, turn_index: int, persona: Persona, slate: list[str]
 ) -> tuple[RiskTurn, list[str]]:
@@ -461,10 +524,10 @@ def _assemble(
 
     accepted = payload.proposes[:cap]
     dropped = payload.proposes[cap:]
-    next_id = len(slate)
+    taken = set(slate)
     for factor in accepted:
-        factor.factor_id = f"RF{next_id:02d}"
-        next_id += 1
+        factor.factor_id = _content_id(factor.text, taken)
+        taken.add(factor.factor_id)
     payload.proposes = accepted
 
     turn = RiskTurn(
@@ -478,13 +541,21 @@ def _assemble(
 
 
 async def run_risk_turn(
-    state, persona: Persona, turn_index: int, client: AsyncAnthropic | None = None
+    state, persona: Persona, turn_index: int, client: AsyncAnthropic | None = None,
+    temperature: float | None = None,
 ) -> RiskTurn:
     """One turn: build the pack, make one forced tool call, run the guards.
 
     Mirrors debate_port.run_debate_turn's shape (one retry on a schema
     violation, then raise out of the node so the checkpoint carries the
     conversation to that point and a resume re-attempts this turn).
+
+    `temperature`: None in every production call path (risk_nodes.py never
+    passes one) — adaptive thinking stays on, matching every turn measured
+    so far. Set explicitly only by the Phase 6 determinism/stability check
+    scripts (`scripts/risk_determinism_check.py`), which is also the only
+    caller that needs thinking disabled to set it at all — see
+    debate_port.reasoning_config.
     """
     _maybe_crash(turn_index, "before")
 
@@ -520,7 +591,7 @@ async def run_risk_turn(
     messages: list[dict] = [{"role": "user", "content": user_text}]
 
     usage = UsageSummary()
-    response = await _submit(client, system_blocks, messages)
+    response = await _submit(client, system_blocks, messages, temperature)
     _accumulate(usage, response.usage)
     try:
         payload = _extract(response)
@@ -533,7 +604,7 @@ async def run_risk_turn(
             f"— {'; '.join(str(first).splitlines()[1:5])}"
         )
         messages = _retry_messages(messages, response, first)
-        retry = await _submit(client, system_blocks, messages)
+        retry = await _submit(client, system_blocks, messages, temperature)
         _accumulate(usage, retry.usage)
         payload = _extract(retry)
 

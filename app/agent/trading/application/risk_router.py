@@ -25,8 +25,8 @@ stronger one.
 
 from app.agent.trading.domain.risk import PERSONAS
 
-RISK_MAX_ROUNDS = 2
-RISK_MAX_TURNS = len(PERSONAS) * RISK_MAX_ROUNDS   # 6
+RISK_MAX_ROUNDS = 3
+RISK_MAX_TURNS = len(PERSONAS) * RISK_MAX_ROUNDS   # 9
 
 
 def next_risk_step(state) -> str:

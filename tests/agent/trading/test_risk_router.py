@@ -69,8 +69,8 @@ def test_router_is_total_and_alternates_below_the_cap(n, with_debate):
 def test_max_turns_is_derived_from_max_rounds_and_persona_count():
     """Guards the recursion_limit the CLI derives from this."""
     assert RISK_MAX_TURNS == len(PERSONAS) * RISK_MAX_ROUNDS
-    assert RISK_MAX_ROUNDS == 2
-    assert RISK_MAX_TURNS == 6
+    assert RISK_MAX_ROUNDS == 3
+    assert RISK_MAX_TURNS == 9
 
 
 def test_router_reaches_the_cap_regardless_of_turn_content():

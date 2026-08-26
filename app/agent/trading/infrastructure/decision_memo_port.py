@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 from app.agent.researcher import _save_output
-from app.agent.trading.domain.decision_memo import DecisionMemo
+from app.agent.trading.domain.decision_memo import DecisionMemo, Verdict
 
 # Fields the pipeline has not implemented yet still carry the literal
 # "STUB" from the synthesizer. Rendering that verbatim under a confident
@@ -22,20 +22,42 @@ def _render(value: str) -> str:
     return value
 
 
+def _render_verdict_line(memo: DecisionMemo) -> str:
+    """`verdict_samples` is empty when no risk panel ran to sample (the
+    Risk Judge's single call is genuinely the sole decision then) and
+    populated whenever `application/nodes.py`'s majority-of-N sampling
+    ran — in which case the verdict is Python's aggregate over several
+    Judge calls, not any one of them alone, and the label should say so
+    rather than keep crediting a single call. See `Verdict.UNRESOLVED`'s
+    docstring for why sampling exists at all."""
+    if not memo.verdict_samples:
+        return (
+            f"**Verdict (Risk Judge, sole decision maker):** "
+            f"{memo.verdict.value.upper()}"
+        )
+    samples = ", ".join(memo.verdict_samples)
+    basis = "no majority" if memo.verdict == Verdict.UNRESOLVED else "majority"
+    return (
+        f"**Verdict:** {memo.verdict.value.upper()} "
+        f"({basis} of {len(memo.verdict_samples)} samples: {samples})"
+    )
+
+
 def _format_memo_markdown(memo: DecisionMemo) -> str:
     lines = [
         f"# {memo.ticker} — Decision Memo",
-        f"**Verdict:** {memo.verdict.value.upper()}  ·  "
-        f"**Confidence:** {memo.confidence:.2f}",
+        f"{_render_verdict_line(memo)}  ·  **Confidence:** {memo.confidence:.2f}",
         f"**Data as of:** {memo.data_as_of_date}",
         "",
     ]
 
     if memo.confidence == 0.0:
         lines += [
-            "> **This memo is not a recommendation.** Confidence is 0.00 and the "
-            "synthesis logic is still a stub — the verdict below is a placeholder "
-            "the schema requires, not a conclusion drawn from the evidence.",
+            "> **Treat this memo with extreme caution.** Confidence computed at "
+            "0.00 — some combination of zero analyst coverage, full ledger "
+            "contestation, and heavy guard-flag density. The verdict below is "
+            "the Risk Judge's real output, not a placeholder, but the observables "
+            "confidence is built from say this run saw very little to go on.",
             "",
         ]
 
@@ -51,6 +73,10 @@ def _format_memo_markdown(memo: DecisionMemo) -> str:
         "## Bear case",
         "",
         _render(memo.bear_case),
+        "",
+        "## Research Manager's thesis",
+        "",
+        _render(memo.research_thesis),
         "",
         "## Technical signal",
         "",
