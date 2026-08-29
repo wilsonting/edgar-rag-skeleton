@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from app.agent.trading.domain.budget import CostEvent
 
 Sentiment = Literal["positive", "negative", "neutral"]
 
@@ -48,6 +50,14 @@ class NewsDigest(BaseModel):
     dropped_missing_date: int
     truncated_by_cap: bool      # did MAX_ARTICLES bite?
     data_source: str = "finnhub"
+    cost_event: CostEvent | None = None
+    # Sanitizer hits (Phase 8) across every article's headline/body at
+    # ingestion — flag-not-drop, so a real article that happens to quote an
+    # injection attempt is still visible in the digest, just visibly flagged.
+    # Per-article flags live in NewsItem below; this is the digest-level
+    # audit trail so a run's sanitizer activity is visible without walking
+    # every item.
+    sanitizer_flags: list[str] = Field(default_factory=list)
 
 
 class SentimentSummary(BaseModel):

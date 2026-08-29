@@ -25,12 +25,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from anthropic import AsyncAnthropic, BadRequestError
+from anthropic import BadRequestError
+from app.infrastructure.llm import LLMBadRequestError, LLMClient, get_client
+from app.infrastructure.llm.models import model_for, warn_if_unpriced
 from pydantic import ValidationError
 
 from app.agent.researcher import (
-    AGENT_MODEL,
-    _MODEL_PRICING,
     UsageSummary,
     _save_output,
     log_cost,
@@ -43,6 +43,8 @@ from app.agent.trading.domain.debate import (
     canonical_claims,
 )
 from app.agent.trading.domain.news_digest import AGGREGATED_RELEVANCE
+from app.agent.trading.domain.sanitize import EXTERNAL_TEXT_FRAMING
+from app.agent.trading.infrastructure.cost_log import new_event_id, record_cost_event
 from app.agent.trading.infrastructure.technical_interpreter_port import (
     _PERIOD_LABEL,
     _flag_unmatched_numbers_against,
@@ -59,7 +61,7 @@ from app.agent.trading.infrastructure.technical_interpreter_port import (
 # and that failure is invisible to both exit criteria — they test
 # termination and resume, not argument quality. Read a transcript by hand
 # after changing this, because no assertion here will tell you.
-DEBATE_MODEL = os.getenv("TRADING_DEBATE_MODEL") or AGENT_MODEL
+DEBATE_MODEL = model_for("debate")
 
 # Room for adaptive thinking plus the tool call. Thinking tokens count
 # against this, so the 1200 that fit a text-only turn does not fit here.
@@ -141,7 +143,7 @@ def reasoning_config(model: str, temperature: float | None) -> dict:
     return {}
 
 
-async def create_with_temperature_fallback(client: AsyncAnthropic, **kwargs):
+async def create_with_temperature_fallback(client: LLMClient, **kwargs):
     """`client.messages.create(**kwargs)`, but if the model rejects
     `temperature` outright, retry once without it.
 
@@ -163,7 +165,7 @@ async def create_with_temperature_fallback(client: AsyncAnthropic, **kwargs):
     """
     try:
         return await client.messages.create(**kwargs)
-    except BadRequestError as e:
+    except (BadRequestError, LLMBadRequestError) as e:
         message = str(e).lower()
         if "temperature" in kwargs and "temperature" in message and "deprecated" in message:
             print(
@@ -177,17 +179,7 @@ async def create_with_temperature_fallback(client: AsyncAnthropic, **kwargs):
         raise
 
 
-if DEBATE_MODEL not in _MODEL_PRICING:
-    # Not fatal, but the budget assertion is the only thing standing between a
-    # prompt-bloat regression and an unbounded bill, and an unpriced model
-    # makes every turn cost None — which sums to 0.00 and can never trip it.
-    # Say so once at import rather than letting the ceiling be silently
-    # absent for a whole run.
-    print(
-        f"[debate] WARNING: no pricing configured for {DEBATE_MODEL} — per-turn "
-        f"costs will log as null and the ${DEBATE_BUDGET_USD:.2f} budget "
-        f"assertion cannot fire. Add it to _MODEL_PRICING in researcher.py."
-    )
+warn_if_unpriced(DEBATE_MODEL, "debate", DEBATE_BUDGET_USD)
 
 # Forced-failure hooks for the resume tests. Deliberately in the port rather
 # than the node: variant B has to die AFTER the API call and before the node
@@ -239,6 +231,8 @@ You are one side of a structured, adversarial equity research debate.
 You will be given an EVIDENCE PACK containing the analyst reports produced for
 this ticker, and the transcript of the debate so far. Argue from the pack.
 
+{EXTERNAL_TEXT_FRAMING}
+
 HARD RULES — these are checked in code after you answer:
 
 1. EVERY figure you write must appear VERBATIM in the evidence pack. Do not
@@ -282,8 +276,12 @@ argue the points where it does.
 
 Call `submit_argument` exactly once. Say nothing else."""
 
-BULL_SYSTEM = _SYSTEM_TEMPLATE.replace("{STANCE}", BULL_STANCE)
-BEAR_SYSTEM = _SYSTEM_TEMPLATE.replace("{STANCE}", BEAR_STANCE)
+BULL_SYSTEM = _SYSTEM_TEMPLATE.replace("{STANCE}", BULL_STANCE).replace(
+    "{EXTERNAL_TEXT_FRAMING}", EXTERNAL_TEXT_FRAMING
+)
+BEAR_SYSTEM = _SYSTEM_TEMPLATE.replace("{STANCE}", BEAR_STANCE).replace(
+    "{EXTERNAL_TEXT_FRAMING}", EXTERNAL_TEXT_FRAMING
+)
 
 _STANCE_BY_SIDE = {"bull": BULL_STANCE, "bear": BEAR_STANCE}
 _SYSTEM_BY_SIDE = {"bull": BULL_SYSTEM, "bear": BEAR_SYSTEM}
@@ -677,12 +675,56 @@ def _flag_debate_numbers(text: str, evidence_pack: str) -> list[str]:
     return list(dict.fromkeys(flagged))
 
 
+# Unit conversion is a power of 1000: a filing reports "$63,887" million or
+# "$14,462,836k", and prose says "$63.9B". Nothing else about the figure
+# changes.
+_SCALE_FACTORS = (1e3, 1e6, 1e9)
+
+
 def _is_rounding_of(raw: str, known: list[float]) -> bool:
-    """True when some pack value rounds to `raw` at `raw`'s own precision.
+    """True when some pack value rounds to `raw` at `raw`'s own precision,
+    at the same scale or a power-of-1000 away from it.
 
     Precision-scoped on purpose. A fixed tolerance widens the guard's blind
     spot as the pack grows; this one does not — "41.2" only ever clears
     against a value in [41.15, 41.25), whatever else is in the pack.
+
+    SCALE was added 2026-08-27 after the Phase 9 battery measured this
+    guard's precision on three live memos and found it inverted: every
+    "may be fabricated" figure it reported was correct and every one was a
+    millions-to-billions restatement it could not see — AVGO's 63.9
+    ($63,887M revenue), 35.8 ($35,819M), 5.7 ($5,747M SBC), NFLX's 10.1
+    ($10,149M OCF), ACN's 69.7 ($69,673M revenue). Meanwhile the one real
+    fabrication in that battery went unreported. A guard whose warnings are
+    reliably wrong is worse than no guard: it teaches the reader to skip
+    the category, and then the true positive arrives in a list nobody reads.
+
+    Scale clearing is deliberately restricted to figures carrying at least
+    one DECIMAL PLACE, and that restriction is the whole safety argument.
+    Dividing the pack by 1000 multiplies the number of values the guard will
+    clear against, which is exactly the density problem `_flag_debate_numbers`
+    exists to avoid — but only for coarse figures. A bare integer like "70"
+    would clear against any pack value in [69500, 70500), a bucket 1000 wide,
+    and "70" is precisely the shape of the fabricated figure this battery
+    caught. A converted figure keeps its significant digits ("$63.9B", never
+    "$64B") because keeping them is the point of converting; so requiring a
+    decimal admits the real restatements and admits none of the round
+    inventions. "63.9" still only ever clears against [63850, 63950).
+
+    RESIDUAL, measured and accepted rather than engineered away: a
+    one-decimal figure clears against a window 100 units wide at the
+    1000-scale, so a coincidental match is possible in a dense corpus. Seen
+    once, in the same Phase 9 re-audit: AVGO's "$2.2B" (pre-VMware SBC,
+    legitimately 6.1% x $35,819M = $2,185M) cleared against an unrelated
+    2,171 elsewhere in the corpus. The figure was sound and the clearance
+    was luck. Tightening this by requiring an explicit magnitude unit does
+    NOT help — the corpus reports in millions, so 2,171M reads as $2.17B and
+    matches at the stated scale too. Containment on a rounded figure against
+    a dense corpus is coarse by construction; the honest trade is 7 measured
+    false positives removed against a coincidence rate that is bounded and
+    documented. Precision here is what `debate_originated_numbers`
+    (synthesis_port) exists to add, by asking a different question — does
+    this figure have an analyst source at all — rather than a looser one.
     """
     try:
         value = float(raw.replace(",", ""))
@@ -690,7 +732,15 @@ def _is_rounding_of(raw: str, known: list[float]) -> bool:
         return False
     fraction = raw.split(".")
     places = len(fraction[1]) if len(fraction) == 2 else 0
-    return any(round(kv, places) == value for kv in known)
+    if any(round(kv, places) == value for kv in known):
+        return True
+    if places == 0:
+        return False   # see the docstring: no scale clearing for bare integers
+    return any(
+        round(kv / factor, places) == value
+        for kv in known
+        for factor in _SCALE_FACTORS
+    )
 
 
 # Formatting, not content: quote characters and whitespace. Everything with
@@ -837,7 +887,7 @@ def check_claim_stability(payload: DebateTurnPayload, turns: list[DebateTurn]) -
 # ---------------------------------------------------------------------------
 
 async def _submit(
-    client: AsyncAnthropic, system_blocks: list[dict], messages: list[dict]
+    client: LLMClient, system_blocks: list[dict], messages: list[dict]
 ):
     reasoning: dict[str, Any] = {}
     if supports_adaptive_thinking(DEBATE_MODEL):
@@ -942,7 +992,7 @@ def _assert_within_budget(ticker: str, turns: list[DebateTurn], this_turn: float
 
 
 async def run_debate_turn(
-    state, side: Side, turn_index: int, client: AsyncAnthropic | None = None
+    state, side: Side, turn_index: int, client: LLMClient | None = None
 ) -> DebateTurn:
     """One turn: build the pack, make one forced tool call, run the guards.
 
@@ -957,7 +1007,7 @@ async def run_debate_turn(
     turns: list[DebateTurn] = list(state.get("debate_turns") or [])
     texts = quotable_texts(state)
     pack = build_evidence_pack(state)
-    client = client or AsyncAnthropic()
+    client = client or get_client(DEBATE_MODEL)
 
     # Two blocks, stance first. The pack is identical across all six turns,
     # so it caches; the stance prefix differs, so bull and bear keep separate
@@ -1001,11 +1051,15 @@ async def run_debate_turn(
     check_concession(payload, turns, side)
     check_rebuts(payload, turns, side)
 
+    node_name = f"{side}_turn"
+    event_id = new_event_id(node_name, turn_index=turn_index)
     cost = log_cost(
         ticker,
         f"trading-debate-{side}-r{(turn_index // 2) + 1}",
         usage,
         model=DEBATE_MODEL,
+        run_id=state.get("run_id"),
+        event_id=event_id,
     )
     _assert_within_budget(ticker, turns, cost)
 
@@ -1024,6 +1078,7 @@ async def run_debate_turn(
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
         estimated_cost_usd=cost,
+        cost_event=record_cost_event(event_id, node_name, usage, DEBATE_MODEL, cost),
     )
 
     _maybe_crash(turn_index, "after")

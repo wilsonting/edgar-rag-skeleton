@@ -27,18 +27,26 @@ from pathlib import Path
 import sys
 import yaml
 
-from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 from datetime import datetime
 from app.agent.prompts import ANALYST_SYSTEM_PROMPT, STEP1_TEST_PROMPT, NEWS_ASSESSMENT_PROMPT
 from app.agent.tools import TOOLS, execute_tool, get_calc_results, get_provenance_corpus, get_session_log, get_unretried_rejected_calcs, record_log_line, reset_run_provenance
 from app.application.memo_verifier import verify_memo
+from app.infrastructure.llm import MODEL_PRICING, get_client
+from app.infrastructure.llm.models import model_for
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-AGENT_MODEL = os.environ["LLM_CLAUDE_MODEL"]
+AGENT_MODEL = model_for("agent")
 MAX_TURNS = int(os.environ["LOOP_MAX_TURNS"])
+# How many turns out from the cap the agent starts being told to wrap up.
+# Phase 9 measured 2 of 3 fundamentals runs hitting MAX_TURNS exactly and
+# ending on "forcing memo from gathered data" — the agent had no idea the
+# budget existed, so it was writing its memo under a guillotine rather than
+# to a deadline. 8 is roughly what the final memo turn plus a couple of
+# closing retrievals need.
+TURN_WARN_AT = 8
 # The 12-item memo with citations and tables routinely runs 8-10k output
 # tokens on its own, before any tool-call turns. The previous 4096 cap was
 # well under that, so the final memo-writing turn was silently cut off
@@ -49,31 +57,13 @@ AGENT_MAX_TOKENS = 16000
 WATCHLIST_PATH = Path("watchlist.yaml")
 MEMO_DIR = Path.home() / os.environ["MEMO_DIR"]
 
-# Pricing per million tokens — add new models as needed
-_MODEL_PRICING = {
-    "claude-haiku-4-5-20251001": {
-        "input": 1.00,
-        "output": 5.00,
-        "cache_write": 1.25,
-        "cache_read": 0.10,
-    },
-    "claude-sonnet-4-5-20250929": {
-        "input": 3.00,
-        "output": 15.00,
-        "cache_write": 3.75,
-        "cache_read": 0.30,
-    },
-    # Sonnet 5 carries an introductory $2/$10 through 2026-08-31 and reverts
-    # to $3/$15 on Sep 1. Budgeted at the standing rate deliberately: pricing
-    # the intro here would make every debate-cost assertion start failing on
-    # a date nobody was watching, and over-estimating cost fails safe.
-    "claude-sonnet-5": {
-        "input": 3.00,
-        "output": 15.00,
-        "cache_write": 3.75,
-        "cache_read": 0.30,
-    },
-}
+# Cost config — per million tokens. The table moved to
+# app/infrastructure/llm/pricing.py when the provider layer landed, because
+# pricing is a property of the provider rather than of this agent. Re-exported
+# under the old name so the three ports and the budget assertions that import
+# `_MODEL_PRICING` from here keep working.
+_MODEL_PRICING = MODEL_PRICING
+
 
 def _trace(msg: str) -> None:
     """Print to stderr so tool traces don't pollute the memo output.
@@ -133,7 +123,10 @@ def _build_news_prompt(ticker: str, news_text: str) -> str:
 # trace the preceding fundamentals run left behind — writing it would pair
 # the wrong evidence with the report. They supply their own provenance or
 # get none.
-_NO_SESSION_LOG_MODES = {"technical", "sentiment", "decision", "debate", "risk"}
+_NO_SESSION_LOG_MODES = {
+    "technical", "sentiment", "decision", "decision_failed", "decision_aborted",
+    "debate", "risk",
+}
 
 
 # The vault filename stem for each mode, minus the ticker. "fundamentals" is
@@ -146,6 +139,8 @@ _MODE_STEMS = {
     "fundamentals": "fundamental",
     "sentiment": "sentiment",
     "decision": "decision",
+    "decision_failed": "decision-FAILED",
+    "decision_aborted": "decision-ABORTED",
     "debate": "debate",
     "risk": "risk",
 }
@@ -153,7 +148,12 @@ _MODE_STEMS = {
 # Modes that file under MEMO_DIR/<ticker>/<date>/ rather than flat under the
 # ticker. Everything the trading pipeline writes, which is what makes a
 # per-run folder worth having at all.
-_DATED_MODES = frozenset({"technical", "fundamentals", "sentiment", "decision", "debate", "risk"})
+_DATED_MODES = frozenset(
+    {
+        "technical", "fundamentals", "sentiment", "decision", "decision_failed",
+        "decision_aborted", "debate", "risk",
+    }
+)
 
 # The instant one pipeline run started, set by `vault_run`; None outside one.
 #
@@ -322,7 +322,13 @@ def _compute_cost(usage: UsageSummary, model: str = AGENT_MODEL) -> float | None
 
 
 def log_cost(
-    ticker: str, mode: str, usage: UsageSummary, model: str = AGENT_MODEL
+    ticker: str,
+    mode: str,
+    usage: UsageSummary,
+    model: str = AGENT_MODEL,
+    *,
+    run_id: str | None = None,
+    event_id: str | None = None,
 ) -> float | None:
     """Append one JSON line to docs/cost-log.jsonl. Returns the estimated
     cost (or None if pricing isn't configured), so callers can also surface
@@ -331,10 +337,21 @@ def log_cost(
     Pass `model` whenever the call being logged did not use AGENT_MODEL. Both
     the logged label and the price come from it — a hardcoded label on a
     differently-priced call produces a log that is wrong twice and looks
-    right."""
+    right.
+
+    `run_id`/`event_id` (Phase 8) are None for calls outside the trading
+    graph — the standalone researcher CLI has no run to group lines under.
+    Trading-pipeline callers pass both (see
+    trading/infrastructure/cost_log.py) so a run's lines can be grouped and
+    a resumed run's duplicate write can be deduped, both by `jq` over this
+    file alone. `kind` distinguishes these lines from the pre-Phase-8 lines
+    already in this file, which have neither field and are read as legacy."""
     cost = _compute_cost(usage, model)
     entry = {
+        "kind": "cost_event",
         "timestamp": datetime.now().isoformat(),
+        "run_id": run_id,
+        "event_id": event_id,
         "ticker": ticker,
         "mode": mode,
         "model": model,
@@ -400,8 +417,24 @@ async def run_agent(user_task: str, system_prompt: str) -> tuple[str, UsageSumma
     Tool traces go to stderr; only the final output goes to stdout.
     """
     reset_run_provenance()
-    client = AsyncAnthropic()
-    messages = [{"role": "user", "content": user_task}]
+    client = get_client(AGENT_MODEL)
+    # The budget goes in the TASK, not the system prompt. The system block
+    # carries its own cache breakpoint and is identical across every run;
+    # interpolating a runtime number into it would rewrite that cache
+    # whenever the config moved, for a line that belongs with the task
+    # anyway. Stated up front rather than only warned about near the end,
+    # so the agent can plan the checklist against it — the same reason
+    # ask_edgar's cap is in its tool description.
+    messages = [{
+        "role": "user",
+        "content": (
+            f"{user_task}\n\n"
+            f"You have {MAX_TURNS} tool-calling turns for this entire "
+            f"analysis, and writing the memo takes several of them. Budget "
+            f"accordingly: cover the checklist broadly before going deep on "
+            f"any one item, and do not leave the memo to the last turn."
+        ),
+    }]
     usage = UsageSummary()
 
     for turn in range(MAX_TURNS):
@@ -505,7 +538,26 @@ async def run_agent(user_task: str, system_prompt: str) -> tuple[str, UsageSumma
                 )
 
         messages.append({"role": "assistant", "content": response.content})
-        messages.append({"role": "user", "content": tool_results})
+        # Tool-result blocks must come first in a user message; a trailing
+        # text block is legal after them.
+        content = list(tool_results)
+        remaining = MAX_TURNS - (turn + 1)
+        if 0 < remaining <= TURN_WARN_AT:
+            # Only inside the warn band, for the same reason the ask_edgar
+            # counter is: every one of these lines lands in the conversation
+            # the agent re-reads on every subsequent turn, and a countdown
+            # appended to all 45 turns would be 45 copies of a changing
+            # number in the context the containment guards scan.
+            content.append({
+                "type": "text",
+                "text": (
+                    f"[BUDGET] {remaining} turn(s) remaining before the memo "
+                    f"is forced. Stop opening new lines of enquiry. Finish "
+                    f"the checklist item you are on, then write the memo, "
+                    f"recording anything you could not cover under Data Gaps."
+                ),
+            })
+        messages.append({"role": "user", "content": content})
 
     # Budget exhausted — force a memo from whatever was gathered.
     _trace("\n[MAX_TURNS reached — forcing memo from gathered data]")

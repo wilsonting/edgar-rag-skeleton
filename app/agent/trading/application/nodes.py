@@ -8,10 +8,11 @@ the caveat computation (`_news_caveats`, `_debate_caveats`, `_risk_caveats`),
 same split as the risk/debate ports vs. their nodes.
 """
 from collections import Counter
-from datetime import date
+from datetime import date, datetime, timezone
 
-from anthropic import AsyncAnthropic
+from app.infrastructure.llm import get_client
 
+from app.agent.trading.application.guards import check_run_guards
 from app.agent.trading.application.risk_ledger import build_risk_ledger
 from app.agent.trading.application.risk_router import RISK_MAX_TURNS
 from app.agent.trading.domain.decision_memo import Verdict
@@ -29,7 +30,17 @@ from app.agent.trading.infrastructure.news_data_port import fetch_company_news, 
 from app.agent.trading.infrastructure.news_digest_port import build_digest
 from app.agent.trading.infrastructure.price_data_port import get_price_history
 from app.agent.trading.application.technical_indicators import compute_indicators
-from app.agent.trading.infrastructure.synthesis_port import run_synthesis
+from app.agent.trading.infrastructure.synthesis_port import (
+    MemoVerificationError,
+    SynthesisFabricationError,
+    SynthesisReferenceError,
+    run_synthesis,
+    verify_decision_memo,
+)
+from app.agent.trading.infrastructure.decision_memo_port import (
+    save_aborted_run_memo,
+    save_failed_decision_memo,
+)
 from app.agent.trading.infrastructure.technical_interpreter_port import interpret_indicators, save_technical_report
 
 # Phase 6 exit-criteria fix (2026-08-26, code review): post-fix measurement
@@ -45,10 +56,50 @@ from app.agent.trading.infrastructure.technical_interpreter_port import interpre
 RISK_VERDICT_SAMPLES = 3
 
 
+async def graceful_abort_node(state: TradingState) -> dict:
+    """The sole destination of every guard edge's "abort" branch (graph.py's
+    `guarded()`) — a budget or deadline breach, never a debate/risk-quality
+    outcome (see application/guards.py's module docstring for why those stay
+    separate). Recomputes the reason rather than having the router pass it
+    along, same pattern debate_close_node uses for `debate_terminated_by`:
+    a router returns only a routing decision, and whatever a node needs
+    beyond that it re-derives from state.
+
+    Writes a partial artifact and a cost-log run_summary line so an aborted
+    run is never silently indistinguishable from one that never ran —
+    same "a truncated result must say so" principle behind
+    debate_terminated_by/risk_terminated_by, one level up.
+    """
+    events = state.get("cost_events") or []
+    budget = state["budget"]
+    terminated_by = check_run_guards(events, budget, datetime.now(timezone.utc))
+    if terminated_by is None:
+        # Only reachable if a guard edge routed here without the guard
+        # actually tripping — a wiring bug, named here rather than silently
+        # writing an artifact that claims a breach that didn't happen.
+        raise RuntimeError(
+            "graceful_abort_node entered but check_run_guards found no "
+            "breach — a guard edge routed here incorrectly."
+        )
+    print(f"[abort] run terminated: {terminated_by.value}")
+    vault_path = save_aborted_run_memo(state, terminated_by)
+    print(f"[abort] saved partial artifact to {vault_path}")
+    return {"run_terminated_by": terminated_by}
+
+
 async def fundamentals_node(state: TradingState) -> dict:
     print(f"[fundamentals] running for {state['ticker']}")
-    report = await get_fundamentals_report(state["ticker"])
-    return {"fundamentals_report": report}
+    report = await get_fundamentals_report(state["ticker"], run_id=state.get("run_id"))
+    # cost_event is None on a cache hit — nothing was spent this run. report
+    # itself can be None too (a test double simulating "analyst did not
+    # run"; the real port never returns None).
+    # Both the agent's own loop AND what its tools spent server-side. The
+    # second used to be invisible to this ledger, which is what let a run
+    # exceed its budget without `check_run_guards` ever seeing it.
+    events = []
+    if report:
+        events = [e for e in (report.cost_event, report.tool_cost_event) if e]
+    return {"fundamentals_report": report, "cost_events": events}
 
 
 async def technical_node(state: TradingState) -> dict:
@@ -70,8 +121,8 @@ async def technical_node(state: TradingState) -> dict:
     if dropped_bars:
         print(f"[technical] dropped {dropped_bars} incomplete bar(s) from {source}")
     indicators = compute_indicators(df)
-    interpretation, flagged, flagged_claims, cost_usd = await interpret_indicators(
-        ticker, indicators
+    interpretation, flagged, flagged_claims, cost_usd, cost_event = await interpret_indicators(
+        ticker, indicators, run_id=state.get("run_id")
     )
     if flagged_claims:
         print(f"[technical] {len(flagged_claims)} contradicted claim(s): {flagged_claims}")
@@ -86,10 +137,11 @@ async def technical_node(state: TradingState) -> dict:
         interpretation=interpretation,
         interpretation_flagged_numbers=flagged,
         interpretation_flagged_claims=flagged_claims,
+        cost_event=cost_event,
     )
     vault_path = save_technical_report(report, cost_usd=cost_usd)
     print(f"[technical] saved report to {vault_path}")
-    return {"technical_report": report}
+    return {"technical_report": report, "cost_events": [cost_event]}
 
 
 async def news_node(state: TradingState) -> dict:
@@ -110,7 +162,9 @@ async def news_node(state: TradingState) -> dict:
         raw, as_of, window_start
     )
 
-    items, issues, cost_usd = await build_digest(clean, ticker)
+    items, issues, cost_usd, cost_event, sanitizer_flags = await build_digest(
+        clean, ticker, run_id=state.get("run_id")
+    )
 
     digest = NewsDigest(
         ticker=ticker,
@@ -122,6 +176,8 @@ async def news_node(state: TradingState) -> dict:
         dropped_out_of_window=dropped_win,
         dropped_missing_date=dropped_missing,
         truncated_by_cap=truncated,
+        cost_event=cost_event,
+        sanitizer_flags=sanitizer_flags,
     )
 
     # Belt-and-braces post-assertion. Cheap, and it turns a silent
@@ -137,7 +193,10 @@ async def news_node(state: TradingState) -> dict:
         f"[news] {len(items)} items (raw={len(raw)} deduped={len(clean)} "
         f"truncated={truncated}) cost={cost_usd}"
     )
-    return {"news_digest": digest, "news_digest_issues": issues}
+    if sanitizer_flags:
+        print(f"[news] sanitizer flagged {len(sanitizer_flags)} article(s): {sanitizer_flags}")
+    events = [cost_event] if cost_event else []
+    return {"news_digest": digest, "news_digest_issues": issues, "cost_events": events}
 
 
 async def sentiment_node(state: TradingState) -> dict:
@@ -406,7 +465,7 @@ def _risk_caveats(state: TradingState) -> tuple[list[str], list[str], list]:
     return gaps, evidence, ledger
 
 
-async def _sample_additional_risk_panel(state: TradingState) -> list:
+async def _sample_additional_risk_panel(state: TradingState) -> tuple[list, list]:
     """One fresh 9-turn risk panel over the SAME fixed debate/technical
     context already in `state`, independent of `state["risk_turns"]` — a
     second (or third) vote for `synthesizer_node`'s majority-of-N sampling,
@@ -428,11 +487,41 @@ async def _sample_additional_risk_panel(state: TradingState) -> list:
     import app.agent.trading.application.risk_nodes as risk_nodes
 
     turns: list = []
+    cost_events: list = []
     for i in range(RISK_MAX_TURNS):
         persona = PERSONAS[i % len(PERSONAS)]
         result = await risk_nodes._risk_turn({**state, "risk_turns": turns}, persona)
         turns.append(result["risk_turns"][0])
-    return turns
+        # Real spend regardless of which sample wins the vote — see the
+        # identical reasoning in synthesizer_node's own loop for why this
+        # must not be dropped just because it's a "sampling" turn.
+        cost_events.extend(result.get("cost_events") or [])
+    return turns, cost_events
+
+
+def _verify_or_raise(memo, state, ledger, debate_turns):
+    """Phase 7: independent re-check of the memo synthesizer_node is about
+    to return, distinct from the per-call guards that already ran during
+    generation (SynthesisFabricationError/SynthesisReferenceError catch a
+    bad call before its output is used; this catches a bad ASSEMBLED
+    artifact). A failure here means a bug slipped past guards that each
+    looked clean on their own — fail loud, but write the memo first (same
+    pattern technical_node/fundamentals_node already use to save from
+    inside a still-executing graph): the failed memo is the debugging
+    artifact, and raising without saving it would re-run the pipeline
+    blind on the next attempt."""
+    result = verify_decision_memo(memo, state, ledger, debate_turns)
+    if not result.passed:
+        vault_path = save_failed_decision_memo(memo, result)
+        raise MemoVerificationError(
+            f"the assembled memo for {state['ticker']} failed post-hoc "
+            f"verification — unbacked number(s): {result.unbacked_numbers}, "
+            f"unresolved reference(s): {result.unresolved_references}. Every "
+            f"per-call guard passed, so this is an assembly-step bug, not an "
+            f"ordinary fabrication. Failed memo saved to {vault_path} for "
+            f"debugging."
+        )
+    return result
 
 
 async def synthesizer_node(state: TradingState) -> dict:
@@ -467,27 +556,91 @@ async def synthesizer_node(state: TradingState) -> dict:
     )
     base_evidence = news_evidence + debate_evidence + risk_evidence
 
-    memo = await run_synthesis(
-        state, ledger=ledger, base_gaps=base_gaps, base_evidence=base_evidence, as_of=as_of
-    )
+    debate_turns = state.get("debate_turns") or []
 
     if not ledger:
         # No risk panel ran (e.g. `--only technical`) — nothing to sample,
         # same single-call behavior as before this change. `verdict_samples`
         # stays its default empty list, which is the honest signal that
         # sampling did not run, not that it ran and produced one entry.
-        return {"decision_memo": memo}
+        memo = await run_synthesis(
+            state, ledger=ledger, base_gaps=base_gaps, base_evidence=base_evidence, as_of=as_of
+        )
+        _verify_or_raise(memo, state, ledger, debate_turns)
+        return {"decision_memo": memo, "cost_events": memo.cost_events}
 
-    memos = [memo]
-    client = AsyncAnthropic()
-    for _ in range(RISK_VERDICT_SAMPLES - 1):
-        sample_turns = await _sample_additional_risk_panel(state)
-        sample_ledger = build_risk_ledger(sample_turns)
-        sample_state = {**state, "risk_turns": sample_turns}
-        memos.append(await run_synthesis(
-            sample_state, ledger=sample_ledger, base_gaps=base_gaps,
-            base_evidence=base_evidence, as_of=as_of, client=client,
-        ))
+    # Each of the RISK_VERDICT_SAMPLES trials is an independent (panel,
+    # Research Manager, Risk Judge) run, and the Research Manager/Risk Judge
+    # calls carry a citation/fabrication guard that raises on an untrusted
+    # output (SynthesisFabricationError, SynthesisReferenceError). Measured
+    # live hit rate is ~1-in-8 calls (trading-agent-known-gaps.md, FIG,
+    # 2026-08-26) — at that rate a 3-sample run has better than even odds of
+    # tripping it somewhere, and letting one trial's guard crash the whole
+    # node threw away every OTHER trial already paid for, including ones
+    # that passed cleanly. A trial the guard blocks is dropped from the
+    # vote instead of aborting the run; only if EVERY trial is dropped does
+    # this raise, since at that point there is genuinely no memo to return.
+    memos: list = []
+    # Parallel to `memos`: the exact (state, ledger) each entry was
+    # generated from. Under majority-of-N sampling every trial ran its own
+    # independent risk panel with its own factor ids, so verifying the
+    # chosen memo against a DIFFERENT trial's ledger would misreport real
+    # citations as unresolved — the context has to travel with its memo.
+    contexts: list[tuple[dict, list]] = []
+    dropped: list[str] = []
+    # Every trial's cost is real regardless of whether its memo survives to
+    # the vote — a dropped trial still spent real tokens (see
+    # SynthesisFabricationError/SynthesisReferenceError's cost_events, which
+    # carry a raising trial's cost out past the except below). Collected
+    # here rather than read off `memos` because `memos` only holds SURVIVING
+    # trials, and undercounting a run's real spend is exactly the failure
+    # mode the run-level budget guard exists to prevent.
+    all_cost_events: list = []
+    # Routing, not bound to one model: this object is handed to
+    # run_synthesis, which uses it for BOTH the Research Manager and the
+    # Risk Judge, and those read two different model env vars.
+    client = get_client()
+    for i in range(RISK_VERDICT_SAMPLES):
+        if i == 0:
+            # The first trial reuses the graph-checkpointed panel already in
+            # `state`/`ledger` rather than sampling a fresh one — same as
+            # before this change.
+            sample_ledger, sample_state, sample_client = ledger, state, None
+        else:
+            sample_turns, sample_cost_events = await _sample_additional_risk_panel(state)
+            all_cost_events.extend(sample_cost_events)
+            sample_ledger = build_risk_ledger(sample_turns)
+            sample_state = {**state, "risk_turns": sample_turns}
+            sample_client = client
+        try:
+            memo = await run_synthesis(
+                sample_state, ledger=sample_ledger, base_gaps=base_gaps,
+                base_evidence=base_evidence, as_of=as_of, client=sample_client,
+            )
+        except (SynthesisFabricationError, SynthesisReferenceError) as exc:
+            print(
+                f"[synthesizer] sample {i + 1}/{RISK_VERDICT_SAMPLES} dropped by "
+                f"the citation/fabrication guard: {exc}"
+            )
+            dropped.append(str(exc))
+            all_cost_events.extend(exc.cost_events)
+            continue
+        memos.append(memo)
+        contexts.append((sample_state, sample_ledger))
+        all_cost_events.extend(memo.cost_events)
+
+    if not memos:
+        # Every trial dropped means the whole node raises, so nothing is
+        # returned to state here — this trial batch's cost_events (already
+        # collected above) are lost from the run-level ledger along with
+        # everything else this node would have returned. Narrow: it needs
+        # EVERY one of RISK_VERDICT_SAMPLES trials to trip the guard, at a
+        # measured ~1-in-8 per-call rate, and the run already fails outright
+        # in this case regardless of Phase 8.
+        raise SynthesisFabricationError(
+            f"all {RISK_VERDICT_SAMPLES} risk-verdict samples for {state['ticker']} "
+            f"were dropped by the citation/fabrication guard — no memo produced: {dropped}"
+        )
 
     verdicts = [m.verdict.value for m in memos]
     top_verdict, top_count = Counter(verdicts).most_common(1)[0]
@@ -499,17 +652,57 @@ async def synthesizer_node(state: TradingState) -> dict:
         # never inconsistent with each other (a memo arguing `sell` should
         # never be labeled `hold` because sample 1 happened to say `hold`
         # while 2 and 3 said `sell`).
-        final = next(m for m in memos if m.verdict.value == top_verdict)
+        final_idx = next(i for i, m in enumerate(memos) if m.verdict.value == top_verdict)
         split_note = f"risk verdict sampled N={len(memos)}: {verdicts} — majority {top_verdict}"
     else:
-        final = memos[0].model_copy(update={"verdict": Verdict.UNRESOLVED})
+        final_idx = 0
         split_note = (
             f"risk verdict sampled N={len(memos)}: {verdicts} — no majority, "
             f"reported as UNRESOLVED rather than picking one sample's answer"
         )
 
+    final = memos[final_idx]
+    final_state, final_ledger = contexts[final_idx]
+    if not has_majority:
+        final = final.model_copy(update={"verdict": Verdict.UNRESOLVED})
+
+    extra_gaps = [split_note]
+    if dropped:
+        extra_gaps.append(
+            f"{len(dropped)} of {RISK_VERDICT_SAMPLES} risk-verdict sample(s) were "
+            f"dropped by the citation/fabrication guard before voting (untrustworthy "
+            f"output, not counted) — this verdict reflects only the surviving "
+            f"{len(memos)} sample(s), a weaker signal than a full {RISK_VERDICT_SAMPLES}-way vote"
+        )
+
     final = final.model_copy(update={
         "verdict_samples": verdicts,
-        "data_gaps": final.data_gaps + [split_note],
+        "data_gaps": final.data_gaps + extra_gaps,
     })
-    return {"decision_memo": final}
+
+    # Verify the memo actually being returned — i.e. after every model_copy
+    # above, not an intermediate — against the SAME trial it came from.
+    # verify_decision_memo itself excludes data_gaps/evidence from its scan
+    # (see its docstring), so this ordering has no effect on WHAT gets
+    # checked, only the hygiene of checking the actual final object rather
+    # than a pre-assembly one.
+    verification = _verify_or_raise(final, final_state, final_ledger, debate_turns)
+
+    # Surfaced as a gap rather than a failure, and only on a memo that
+    # already passed. These figures have an antecedent — the debate or the
+    # risk panel stated them — but no ANALYST REPORT contains them, so
+    # their only source is a model. Most are sound derivations from
+    # grounded endpoints (a growth rate, a difference); some are not, and
+    # containment cannot tell those apart. Gating would fail nearly every
+    # memo that states a growth rate, and staying silent is what let the
+    # distinction go unnoticed until Phase 9 went looking for it.
+    if verification.debate_originated_numbers:
+        final = final.model_copy(update={"data_gaps": final.data_gaps + [
+            f"{len(verification.debate_originated_numbers)} figure(s) in the "
+            f"memo's load-bearing reasoning appear nowhere in any analyst "
+            f"report — the debate or risk panel originated them, so they are "
+            f"derivations or assertions, not cited evidence: "
+            + ", ".join(verification.debate_originated_numbers)
+        ]})
+
+    return {"decision_memo": final, "cost_events": all_cost_events}

@@ -94,7 +94,8 @@ async def _debate_turn(state: TradingState, side: Side) -> dict:
     # A DELTA, never the accumulated list. `operator.add` concatenates, so
     # returning the whole list doubles it every super-step — and that failure
     # looks exactly like the runaway loop this phase exists to bound.
-    return {"debate_turns": [turn]}
+    events = [turn.cost_event] if turn.cost_event else []
+    return {"debate_turns": [turn], "cost_events": events}
 
 
 async def bull_turn_node(state: TradingState) -> dict:

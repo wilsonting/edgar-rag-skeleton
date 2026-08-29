@@ -58,7 +58,8 @@ async def _risk_turn(state: TradingState, persona: Persona) -> dict:
         f"flags={len(turn.guard_flags)}"
     )
 
-    return {"risk_turns": [turn]}
+    events = [turn.cost_event] if turn.cost_event else []
+    return {"risk_turns": [turn], "cost_events": events}
 
 
 async def neutral_turn_node(state: TradingState) -> dict:

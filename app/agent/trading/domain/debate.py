@@ -13,6 +13,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.agent.trading.domain.budget import CostEvent
+
 Side = Literal["bull", "bear"]
 Stance = Literal["hold", "sharpen", "concede"]
 
@@ -153,6 +155,14 @@ class DebateTurn(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     estimated_cost_usd: float | None = None
+    # Phase 8: the same call's cost, in the shape TradingState.cost_events
+    # needs (cache token breakdown, a stable event_id for resume dedup).
+    # Duplicates estimated_cost_usd/input_tokens/output_tokens above rather
+    # than replacing them — those two fields serve different readers
+    # (the CLI's per-turn cost printout vs. the run-level budget ledger)
+    # and this codebase does not disturb an established Python-owned field
+    # just because a new consumer wants overlapping data.
+    cost_event: CostEvent | None = None
 
 
 def canonical_claims(turns: list[DebateTurn]) -> dict[str, DebateClaim]:

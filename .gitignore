@@ -18,3 +18,5 @@ extraction_truth.yaml
 
 # dev cache for trading agent
 .fundamentals_cache/
+# env backups
+.env.bak-*

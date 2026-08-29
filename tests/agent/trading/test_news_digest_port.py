@@ -126,6 +126,59 @@ def test_bracketed_index_is_accepted_not_dropped():
     assert [i.sentiment for i in items] == ["neutral", "positive", "negative"]
 
 
+def test_a_batch_wrapped_in_an_extra_array_is_unwrapped_not_dropped():
+    """Regression, from the ASML run on deepseek-v4-flash (2026-08-29): one
+    batch came back as [[{...}, ...]] instead of [{...}, ...].
+
+    The outer list passes the "is it an array" check in `_summarize_batch`,
+    so it reached the join, where `obj["index"]` on a list raises TypeError.
+    Every article in the batch was flagged unparseable and dropped — seven
+    real stories — and the digest then scored ASML off the five that
+    survived elsewhere. Same reasoning as the bracketed-index case above:
+    the nesting is unambiguous, so recovering it beats losing articles the
+    model summarised correctly."""
+    articles = _articles(3)
+    inner = [
+        {"index": 0, "summary": "s0", "sentiment": "neutral", "relevance": "primary"},
+        {"index": 1, "summary": "s1", "sentiment": "positive", "relevance": "primary"},
+        {"index": 2, "summary": "s2", "sentiment": "negative", "relevance": "primary"},
+    ]
+
+    items, issues = _join(articles, [inner])
+
+    assert issues == []
+    assert [i.headline for i in items] == ["headline 0", "headline 1", "headline 2"]
+
+
+def test_only_one_level_of_nesting_is_unwrapped():
+    """A deeper structure is a genuinely malformed response, not the known
+    one-level wrap, and must still be flagged rather than ride in on the
+    recovery."""
+    articles = _articles(2)
+    obj = {"index": 0, "summary": "s0", "sentiment": "neutral", "relevance": "primary"}
+
+    items, issues = _join(articles, [[[obj]]])
+
+    assert items == []
+    assert any("unparseable index" in i for i in issues)
+    assert any("missing index 0" in i for i in issues)
+
+
+def test_partial_nesting_recovers_every_article():
+    """The wrap has been seen covering only part of a batch."""
+    articles = _articles(3)
+    flat = {"index": 0, "summary": "s0", "sentiment": "neutral", "relevance": "primary"}
+    wrapped = [
+        {"index": 1, "summary": "s1", "sentiment": "neutral", "relevance": "primary"},
+        {"index": 2, "summary": "s2", "sentiment": "neutral", "relevance": "primary"},
+    ]
+
+    items, issues = _join(articles, [flat, wrapped])
+
+    assert issues == []
+    assert len(items) == 3
+
+
 def test_parse_index_accepts_unambiguous_forms_and_rejects_guesswork():
     assert _parse_index(3) == 3
     assert _parse_index("3") == 3
@@ -199,14 +252,14 @@ async def test_build_digest_batches_and_logs_cost_once(monkeypatch):
             _fake_usage(),
         )
 
-    def fake_log_cost(ticker, mode, usage):
+    def fake_log_cost(ticker, mode, usage, *args, **kwargs):
         log_calls.append((ticker, mode, usage.input_tokens, usage.output_tokens))
         return 0.0123
 
     monkeypatch.setattr(news_digest_port, "_summarize_batch", fake_summarize)
     monkeypatch.setattr(news_digest_port, "log_cost", fake_log_cost)
 
-    items, issues, cost = await build_digest(articles, "ACN")
+    items, issues, cost, _cost_event, _flags = await build_digest(articles, "ACN")
 
     # a multiset, not a sequence: batches run concurrently, so the order they
     # start in is not a property worth pinning
@@ -238,9 +291,9 @@ async def test_item_order_follows_input_not_completion_order(monkeypatch):
         )
 
     monkeypatch.setattr(news_digest_port, "_summarize_batch", fake_summarize)
-    monkeypatch.setattr(news_digest_port, "log_cost", lambda *a: 0.01)
+    monkeypatch.setattr(news_digest_port, "log_cost", lambda *a, **k: 0.01)
 
-    items, issues, _ = await build_digest(articles, "ACN")
+    items, issues, _, _cost_event, _flags = await build_digest(articles, "ACN")
 
     assert issues == []
     assert [i.headline for i in items] == [a["headline"] for a in articles]
@@ -263,9 +316,9 @@ async def test_one_unparseable_batch_costs_its_articles_not_the_run(monkeypatch)
         )
 
     monkeypatch.setattr(news_digest_port, "_summarize_batch", fake_summarize)
-    monkeypatch.setattr(news_digest_port, "log_cost", lambda *a: 0.01)
+    monkeypatch.setattr(news_digest_port, "log_cost", lambda *a, **k: 0.01)
 
-    items, issues, cost = await build_digest(articles, "ACN")
+    items, issues, cost, _cost_event, _flags = await build_digest(articles, "ACN")
 
     assert len(items) == BATCH_SIZE          # the surviving batch is intact
     assert cost == 0.01
@@ -308,7 +361,7 @@ async def test_concurrency_is_bounded(monkeypatch):
         )
 
     monkeypatch.setattr(news_digest_port, "_summarize_batch", fake_summarize)
-    monkeypatch.setattr(news_digest_port, "log_cost", lambda *a: 0.01)
+    monkeypatch.setattr(news_digest_port, "log_cost", lambda *a, **k: 0.01)
 
     await build_digest(articles, "ACN")
 
@@ -323,9 +376,10 @@ async def test_build_digest_empty_input_skips_llm_entirely(monkeypatch):
 
     monkeypatch.setattr(news_digest_port, "_summarize_batch", explode)
 
-    items, issues, cost = await build_digest([], "ACN")
+    items, issues, cost, cost_event, flags = await build_digest([], "ACN")
 
     assert items == [] and issues == [] and cost is None
+    assert cost_event is None and flags == []
 
 
 # ---------------------------------------------------------------------------

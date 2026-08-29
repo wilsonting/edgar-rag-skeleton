@@ -427,3 +427,39 @@ async def test_an_explicit_temperature_is_sent_and_disables_thinking():
     call = client.messages.calls[0]
     assert call["temperature"] == 0.0
     assert "thinking" not in call
+
+
+# ---------------------------------------------------------------------------
+# Gate B follow-up: the cached prefix must not vary with phase
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_system_prompt_is_identical_across_phases_for_the_same_persona():
+    """Cost fix: `_PHASE_INSTRUCTIONS` used to be baked into the cached
+    system block, so a persona's round-1 turn (phase=enumerate) and its
+    round-2 turn (phase=adjudicate) produced DIFFERENT system text — a
+    guaranteed cache miss on every phase transition, live-measured as ~2 of
+    every 3 rounds paying full price. Phase text now lives in the per-turn
+    user message instead, so the cached prefix (system + evidence pack) must
+    be byte-identical for the same persona regardless of phase — this is the
+    regression lock for that."""
+    prior = [
+        RiskTurn(turn_index=0, round_num=1, persona="neutral", payload=RiskTurnPayload(argument="a")),
+        RiskTurn(turn_index=1, round_num=1, persona="aggressive", payload=RiskTurnPayload(argument="a")),
+        RiskTurn(turn_index=2, round_num=1, persona="conservative", payload=RiskTurnPayload(argument="a")),
+    ]
+    client = _FakeClient([_turn_payload(), _turn_payload()])
+
+    await port.run_risk_turn(_state(), "neutral", 0, client=client)          # phase=enumerate
+    await port.run_risk_turn(_state(risk_turns=prior), "neutral", 3, client=client)  # phase=adjudicate
+
+    enumerate_system, adjudicate_system = (c["system"] for c in client.messages.calls)
+    assert enumerate_system == adjudicate_system, (
+        "neutral's system prompt differs between the enumerate and adjudicate "
+        "phases — this is a cache miss on every phase transition, not just a "
+        "cost regression"
+    )
+    # And the phase-specific instruction now lives in the user message,
+    # not silently dropped in the move.
+    assert "THIS TURN: enumerate" in client.messages.calls[0]["messages"][0]["content"]
+    assert "THIS TURN: you are the neutral moderator" in client.messages.calls[1]["messages"][0]["content"]

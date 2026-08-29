@@ -3,6 +3,8 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
+from app.agent.trading.domain.budget import CostEvent
+
 
 class Verdict(str, Enum):
     BUY = "buy"
@@ -81,7 +83,7 @@ class RiskJudgePayload(BaseModel):
     No numbers, no quotes, same rule as the Research Manager.
     """
 
-    risk_narrative: str = Field(description="<=200 words. Cite factors as [RF00].")
+    risk_narrative: str = Field(description="<=200 words. Cite factors as [RF1A2B].")
     reasoning: str = Field(
         description=(
             "<=250 words. The FINAL reasoning behind `verdict` — weigh the risk "
@@ -92,7 +94,7 @@ class RiskJudgePayload(BaseModel):
     watch_items: list[str] = Field(
         default_factory=list,
         max_length=5,
-        description="Observables that would change this read. Each must cite [RF00].",
+        description="Observables that would change this read. Each must cite [RF1A2B].",
     )
     verdict: IndividualVerdict = Field(description="THE final verdict. buy/sell/hold — no fourth option.")
 
@@ -134,3 +136,10 @@ class DecisionMemo(BaseModel):
     data_gaps: list[str] = []
     assumptions: list[str] = []
     evidence: list[str] = []
+    # The Research Manager's and Risk Judge's own CostEvents (Phase 8) —
+    # NOT the majority-of-N sampling's other trials' cost, which the
+    # synthesizer node collects separately and returns as its own state
+    # delta, since a dropped/non-winning trial's spend is real even though
+    # its memo never reaches this field. See application/nodes.py's
+    # synthesizer_node.
+    cost_events: list[CostEvent] = []

@@ -167,6 +167,38 @@ def test_resolve_refs_names_the_unresolved_id():
     assert port.resolve_refs(texts, claims, ledger_by_id) == ["RF99"]
 
 
+# The three below use HEX factor ids on purpose. `_content_id` (risk_port)
+# mints `RF` + a 4-char SHA-1 prefix in uppercase hex, so a real slate looks
+# like RF487E/RFC50B/RF6ECA — while every other fixture in this file (and in
+# test_risk_ledger/test_risk_port) still says RF00, the shape ids had before
+# the 2026-08-26 content-hash change. That gap is exactly how `RF\d+` in
+# _REF_PATTERN survived: the suite only ever fed it the ~15% of the id space
+# that happens to be all digits. Live NFLX memo, 2026-08-26: five factors
+# cited, four hex, and one rendered.
+
+def _hex_ledger():
+    """A ledger whose ids are shaped the way `_content_id` really makes them."""
+    return [_ledger()[0].model_copy(update={"factor_id": "RF487E"})]
+
+
+def test_extract_refs_finds_a_hex_factor_id():
+    refs = port.extract_refs("structural downtrend intact [RFC50B]")
+    assert refs == ["RFC50B"]
+
+
+def test_resolve_refs_flags_an_unresolved_hex_factor_id():
+    ledger_by_id = {e.factor_id: e for e in _hex_ledger()}
+    texts = ["cites a real one [RF487E] and an invented one [RFDEAD]"]
+    assert port.resolve_refs(texts, {}, ledger_by_id) == ["RFDEAD"]
+
+
+def test_render_evidence_includes_a_hex_id_factor():
+    ledger_by_id = {e.factor_id: e for e in _hex_ledger()}
+    lines = port._render_evidence(["the decisive risk is [RF487E]"], {}, ledger_by_id)
+    assert len(lines) == 1
+    assert lines[0].startswith("[RF487E]")
+
+
 # ---------------------------------------------------------------------------
 # Criterion 4 — reference integrity, through run_synthesis end to end.
 # Each unresolved-reference case below supplies research payloads that
@@ -241,6 +273,39 @@ async def test_an_unbacked_number_in_risk_judge_reasoning_blocks_the_run():
 
     with pytest.raises(port.SynthesisFabricationError):
         await coro
+
+
+@pytest.mark.anyio
+async def test_a_blocked_research_manager_call_still_logs_its_cost(monkeypatch):
+    """log_cost must run before the fabrication guard's raise: the guard
+    fires only after the LLM call already spent real tokens, and logging
+    after the raise meant a blocked call's spend never reached
+    cost-log.jsonl (trading-agent-known-gaps.md, FIG, 2026-08-26)."""
+    logged = []
+    monkeypatch.setattr(port, "log_cost", lambda *a, **k: logged.append(a[:2]) or 0.02)
+
+    bait = _research_payload(thesis="Revenue could reach $9,999 million [C:margin-hold].")
+    coro, _ = _run([bait])
+
+    with pytest.raises(port.SynthesisFabricationError):
+        await coro
+
+    assert ("ACN", "trading-research-manager") in logged
+
+
+@pytest.mark.anyio
+async def test_a_blocked_risk_judge_call_still_logs_its_cost(monkeypatch):
+    logged = []
+    monkeypatch.setattr(port, "log_cost", lambda *a, **k: logged.append(a[:2]) or 0.02)
+
+    bait = _risk_payload(reasoning="Losses could hit $12,345 thousand [RF00].")
+    coro, _ = _run([_research_payload(), bait])
+
+    with pytest.raises(port.SynthesisFabricationError):
+        await coro
+
+    assert ("ACN", "trading-research-manager") in logged  # the earlier, clean call
+    assert ("ACN", "trading-risk-judge") in logged          # the blocked call itself
 
 
 @pytest.mark.anyio
@@ -356,6 +421,237 @@ async def test_happy_path_assembles_a_complete_memo():
 
 
 # ---------------------------------------------------------------------------
+# Post-hoc memo verification (Phase 7) — verify_decision_memo re-checks the
+# FULLY ASSEMBLED memo, independent of the per-call guards above that only
+# ever see one call's own payload fields. Same containment methodology
+# (_numeric_guard/_flag_debate_numbers), not a second implementation.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_a_clean_assembled_memo_passes_post_hoc_verification():
+    coro, _ = _run([_research_payload(), _risk_payload()])
+    memo = await coro
+
+    result = port.verify_decision_memo(memo, _state(), _ledger(), _debate_turns())
+
+    assert result.passed
+    assert result.unbacked_numbers == []
+    assert result.unresolved_references == []
+
+
+@pytest.mark.anyio
+async def test_a_number_spliced_into_the_assembled_memo_fails_verification():
+    """The per-call guards already passed on the way to `memo` — this
+    proves the post-hoc check catches a fabrication introduced AFTER
+    generation (e.g. by assembly or rendering), not just re-deriving what
+    the guard already knew."""
+    coro, _ = _run([_research_payload(), _risk_payload()])
+    memo = await coro
+    corrupted = memo.model_copy(update={
+        "reasoning": memo.reasoning + " Margin could reach 91.4 next year."
+    })
+
+    result = port.verify_decision_memo(corrupted, _state(), _ledger(), _debate_turns())
+
+    assert not result.passed
+    assert "91.4" in result.unbacked_numbers
+
+
+# ---------------------------------------------------------------------------
+# Corpus tiering (2026-08-27). `_numeric_corpus` used to merge the analyst
+# reports with the debate's own claims and the risk ledger, so a figure the
+# DEBATE invented was already "somewhere upstream" by the time the memo
+# cited it -- which is the whole of what exact containment tests. The
+# post-hoc check now runs twice, against grounded-only and against
+# grounded+derived, and the difference is the finding.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_a_figure_only_the_debate_states_is_reported_as_debate_originated():
+    """The number has an antecedent (the debate said it), so it is NOT
+    unbacked -- but no analyst report contains it, so its only source is a
+    model. That distinction is invisible against a merged corpus."""
+    coro, _ = _run([_research_payload(), _risk_payload()])
+    memo = await coro
+    turns = _debate_turns()
+    invented = turns[0].model_copy(deep=True)
+    invented.payload.claims[0].text += " Financing could reach 88.6 billion."
+    corrupted = memo.model_copy(update={
+        "reasoning": memo.reasoning + " Financing could reach 88.6 billion."
+    })
+
+    result = port.verify_decision_memo(
+        corrupted, _state(debate_turns=[invented, *turns[1:]]), _ledger(),
+        [invented, *turns[1:]],
+    )
+
+    assert "88.6" in result.debate_originated_numbers
+    assert "88.6" not in result.unbacked_numbers
+
+
+@pytest.mark.anyio
+async def test_debate_originated_numbers_do_not_gate():
+    """Reported, never blocking. A memo that states any growth rate carries
+    derived figures the reports do not contain verbatim; gating on those
+    would fail nearly every real memo. Live check, three Phase 9 memos: the
+    only debate-originated figures were AVGO's 78% (63,887/35,819-1) and
+    5.4 (7,570-2,185), both sound derivations from grounded endpoints."""
+    coro, _ = _run([_research_payload(), _risk_payload()])
+    memo = await coro
+    turns = _debate_turns()
+    invented = turns[0].model_copy(deep=True)
+    invented.payload.claims[0].text += " Growth of 88.6 percent."
+    corrupted = memo.model_copy(update={
+        "reasoning": memo.reasoning + " Growth of 88.6 percent."
+    })
+
+    result = port.verify_decision_memo(
+        corrupted, _state(debate_turns=[invented, *turns[1:]]), _ledger(),
+        [invented, *turns[1:]],
+    )
+
+    assert result.debate_originated_numbers
+    assert result.passed
+
+
+@pytest.mark.anyio
+async def test_a_figure_the_analyst_report_states_is_neither_flag():
+    coro, _ = _run([_research_payload(), _risk_payload()])
+    memo = await coro
+    # 34.1% is in the fundamentals summary -- see _state().
+    corrupted = memo.model_copy(update={
+        "reasoning": memo.reasoning + " Operating margin stands at 34.1%."
+    })
+
+    result = port.verify_decision_memo(corrupted, _state(), _ledger(), _debate_turns())
+
+    assert "34.1" not in result.unbacked_numbers
+    assert "34.1" not in result.debate_originated_numbers
+
+
+@pytest.mark.anyio
+async def test_an_unresolvable_reference_spliced_into_the_assembled_memo_fails_verification():
+    coro, _ = _run([_research_payload(), _risk_payload()])
+    memo = await coro
+    corrupted = memo.model_copy(update={
+        "reasoning": memo.reasoning + " A latent risk exists [RF99]."
+    })
+
+    result = port.verify_decision_memo(corrupted, _state(), _ledger(), _debate_turns())
+
+    assert not result.passed
+    assert result.unresolved_references == ["RF99"]
+
+
+def test_verification_works_standalone_not_only_after_run_synthesis():
+    """Constructs a DecisionMemo directly, never through run_synthesis —
+    proves the check is a real, independent re-derivation over whatever
+    memo it's handed, not something that only works because it's reusing a
+    flag the generation path already computed."""
+    from app.agent.trading.domain.decision_memo import DecisionMemo
+
+    memo = DecisionMemo(
+        ticker="ACN", bull_case="clean", bear_case="clean",
+        research_thesis="clean", risk_debate_summary="clean",
+        technical_signal="clean", reasoning="Fabricated growth of 63.2%.",
+        watch_items=[], verdict=Verdict.HOLD, confidence=0.5,
+        data_as_of_date=date(2026, 8, 19), data_gaps=[], assumptions=[], evidence=[],
+    )
+
+    result = port.verify_decision_memo(memo, _state(), _ledger(), _debate_turns())
+
+    assert not result.passed
+    assert "63.2" in result.unbacked_numbers or "63.2%" in result.unbacked_numbers
+
+
+def test_memo_verification_error_is_not_caught_by_the_per_call_guard_exceptions():
+    """MemoVerificationError signals a different, more serious failure
+    class than SynthesisFabricationError/SynthesisReferenceError (an
+    assembly-step bug vs. an ordinary bad call) — it must not be an
+    instance of either, or a caller's `except SynthesisFabricationError`
+    (e.g. synthesizer_node's per-trial drop-and-continue) would silently
+    swallow it as if it were just another droppable trial failure."""
+    assert not issubclass(port.MemoVerificationError, port.SynthesisFabricationError)
+    assert not issubclass(port.MemoVerificationError, port.SynthesisReferenceError)
+
+    err = port.MemoVerificationError("assembled memo failed verification")
+    with pytest.raises(port.MemoVerificationError):
+        try:
+            raise err
+        except (port.SynthesisFabricationError, port.SynthesisReferenceError):
+            pytest.fail("MemoVerificationError was caught by the per-call guard except clause")
+
+
+def test_an_unbacked_number_confined_to_watch_items_passes_verification():
+    """Live regression (ASML, 2026-08-26): watch_items is a GAP-ONLY field
+    at generation time (run_risk_judge flags an unbacked watch_items number
+    into data_gaps rather than blocking on it — same test file, watch_items
+    test above), so the assembled memo is legitimately allowed to carry one.
+    The first version of verify_decision_memo scanned watch_items as if it
+    were load-bearing and raised MemoVerificationError on exactly this case
+    — a stricter standard than generation time itself applies, which is the
+    assembly-step bug this function exists to catch, not a fabrication."""
+    from app.agent.trading.domain.decision_memo import DecisionMemo
+
+    memo = DecisionMemo(
+        ticker="ACN", bull_case="clean", bear_case="clean",
+        research_thesis="clean", risk_debate_summary="clean",
+        technical_signal="clean", reasoning="clean",
+        watch_items=["Volume surge above 0.80x of 20-day average would change this."],
+        verdict=Verdict.HOLD, confidence=0.5, data_as_of_date=date(2026, 8, 19),
+        data_gaps=["1 number(s) in the Risk Judge's watch items did not appear "
+                   "in any source and may be fabricated: 0.80"],
+        assumptions=[], evidence=[],
+    )
+
+    result = port.verify_decision_memo(memo, _state(), _ledger(), _debate_turns())
+
+    assert result.passed
+
+
+def test_an_unbacked_number_confined_to_bull_or_bear_case_passes_verification():
+    """Same principle as the watch_items case above, for the Research
+    Manager's own gap-only fields (bull_case/bear_case) — see
+    test_an_unbacked_number_in_bull_case_is_a_gap_not_a_block."""
+    from app.agent.trading.domain.decision_memo import DecisionMemo
+
+    memo = DecisionMemo(
+        ticker="ACN", bull_case="Upside could reach $7,777 million.",
+        bear_case="clean", research_thesis="clean", risk_debate_summary="clean",
+        technical_signal="clean", reasoning="clean", watch_items=[],
+        verdict=Verdict.HOLD, confidence=0.5, data_as_of_date=date(2026, 8, 19),
+        data_gaps=["number 7777 did not appear in any source and may be fabricated"],
+        assumptions=[], evidence=[],
+    )
+
+    result = port.verify_decision_memo(memo, _state(), _ledger(), _debate_turns())
+
+    assert result.passed
+
+
+def test_verification_does_not_scan_data_gaps_or_evidence():
+    """data_gaps deliberately quotes already-flagged unbacked numbers (that
+    IS why they're gaps); evidence is Python-rendered from resolved
+    references, not model prose. Scanning either would just re-report
+    numbers the pipeline already knows about, not find something new."""
+    from app.agent.trading.domain.decision_memo import DecisionMemo
+
+    memo = DecisionMemo(
+        ticker="ACN", bull_case="clean", bear_case="clean",
+        research_thesis="clean", risk_debate_summary="clean",
+        technical_signal="clean", reasoning="clean",
+        watch_items=[], verdict=Verdict.HOLD, confidence=0.5,
+        data_as_of_date=date(2026, 8, 19),
+        data_gaps=["number 77.7 did not appear in any source and may be fabricated"],
+        assumptions=[], evidence=["[C:margin-hold] cites 77.7 in the debate"],
+    )
+
+    result = port.verify_decision_memo(memo, _state(), _ledger(), _debate_turns())
+
+    assert result.passed
+
+
+# ---------------------------------------------------------------------------
 # Confidence — computed, not model-emitted
 # ---------------------------------------------------------------------------
 
@@ -422,3 +718,22 @@ def test_research_manager_and_risk_judge_follow_the_project_wide_model_by_defaul
 
     assert port.RESEARCH_MANAGER_MODEL == AGENT_MODEL
     assert port.RISK_JUDGE_MODEL == AGENT_MODEL
+
+
+@pytest.mark.anyio
+async def test_verify_or_raise_returns_the_verification_for_the_caller():
+    """It used to return None. `synthesizer_node` now reads
+    `debate_originated_numbers` off the result to append a data gap, so a
+    silent None here would be an AttributeError on every clean run -- the
+    kind of break that only shows up in production because the passing path
+    is the one nobody asserts on."""
+    from app.agent.trading.application import nodes
+
+    coro, _ = _run([_research_payload(), _risk_payload()])
+    memo = await coro
+
+    result = nodes._verify_or_raise(memo, _state(), _ledger(), _debate_turns())
+
+    assert result is not None
+    assert result.passed
+    assert isinstance(result.debate_originated_numbers, list)

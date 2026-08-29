@@ -20,6 +20,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.agent.trading.domain.budget import CostEvent
+
 Persona = Literal["neutral", "aggressive", "conservative"]
 PERSONAS: tuple[Persona, ...] = ("neutral", "aggressive", "conservative")
 
@@ -158,6 +160,9 @@ class RiskTurn(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     estimated_cost_usd: float | None = None
+    # Phase 8 — see DebateTurn.cost_event's comment for why this duplicates
+    # rather than replaces the fields above.
+    cost_event: CostEvent | None = None
 
 
 class RiskLedgerEntry(BaseModel):

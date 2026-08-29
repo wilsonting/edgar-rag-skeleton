@@ -21,6 +21,27 @@ class EdgarRateLimitError(Exception):
 DOMESTIC_FORM_TYPES = ["10-K", "10-Q", "8-K"]
 FOREIGN_PRIVATE_ISSUER_FORM_TYPES = ["20-F", "6-K"]
 
+# The PERIODIC reports only — the financial statements a fundamentals
+# checklist is actually built from. 8-K and 6-K are event-driven and
+# individually rare-to-load-bearing for that analysis, but they dominate the
+# filing list by count: NFLX's `check_latest_filings` returned 44 filings of
+# which 38 were 8-Ks, ~1,700 tokens that then rode in the agent's context for
+# the remaining ~43 turns (Phase 9 cost audit). Callers that genuinely want
+# event filings ask for them by name.
+PERIODIC_ONLY = {
+    "10-K": ["10-K", "10-Q"],
+    "20-F": ["20-F"],
+}
+
+
+def periodic_forms(form_types: list[str]) -> list[str]:
+    """Narrow a form-type family to its periodic members, preserving the
+    domestic/foreign detection that produced it."""
+    for marker, periodic in PERIODIC_ONLY.items():
+        if marker in form_types:
+            return [f for f in periodic if f in form_types]
+    return form_types
+
 class EdgarClient:
     """
     Minimal SEC EDGAR client.

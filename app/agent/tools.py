@@ -3,16 +3,79 @@ Tool schemas and dispatch for the research agent.
 """
 
 import ast
+import logging
 import operator
+import os
 import re
 import sys
 
 import httpx
+from pydantic import ValidationError
+
+from app.domain.token_usage import USAGE_HEADER, TokenUsage
 
 
 # Base URL of your running FastAPI server. Override when you wire step 2.
+logger = logging.getLogger(__name__)
+
 API_BASE = "http://localhost:8000"
 HTTP_TIMEOUT = 300.0  # ingestion can be slow; give it room
+
+# `ask_edgar` is the most expensive thing the agent can do and nothing
+# bounded it. Measured on the Phase 9 battery: NFLX 22 calls, AVGO 40, ACN
+# 40, every question distinct (checked -- there is no duplicate work to
+# dedupe away). At ~$0.008 of server-side spend per call plus a full context
+# round-trip, the call count is the single biggest cost lever in a
+# fundamentals run.
+#
+# The budget is announced to the agent rather than sprung on it. A blind cap
+# truncates wherever the agent happens to be when it trips, which on a
+# 12-item checklist means the last items silently get nothing; an announced
+# one lets it allocate. That is the same reasoning behind telling a person a
+# deadline at the start rather than at the end.
+#
+# 30 is a judgement, not a measurement: above NFLX's 22, below the 40 that
+# AVGO and ACN each used. ACN completed its checklist in 40, so this WILL
+# bind on dense tickers -- deliberately, since the alternative is an
+# unbounded cost per run. Raise it with ASK_EDGAR_MAX_CALLS if a ticker's
+# analysis is being cut short in a way that matters.
+ASK_EDGAR_MAX_CALLS = int(os.getenv("ASK_EDGAR_MAX_CALLS", "30"))
+# Chunks retrieved per ask_edgar call, and ~77% of a call's input cost:
+# each chunk averages ~610 tokens, so 8 -> 5 would save ~1,800 tokens/call,
+# ~$0.05 per fundamentals run at 30 calls.
+#
+# 5 WAS TRIED AND REVERTED (2026-08-27). Run
+# `scripts/probe_retrieval_rank_decay.py` before touching this -- it replays
+# the real questions from a battery. Over 102 of them:
+#
+#     rank 1 mean similarity 0.6799 ... rank 8 mean similarity 0.6451
+#     rank 1 -> rank 8 decay 5.1%       rank 5 -> rank 6 drop 0.5%
+#     ranks 6-8 supply a section_path absent from ranks 1-5: 59% of questions
+#
+# There is no cliff at 5. The tail is nearly as relevant as the head, and on
+# a majority of questions it carries filing sections nothing else retrieved
+# -- which is what a cross-section forensic checklist exists to read. The
+# five cents is real; so is the coverage, and the coverage is worth more.
+#
+# Sent explicitly rather than leaning on the /ask endpoint's own default, so
+# the agent's retrieval width cannot silently track an unrelated API default.
+ASK_EDGAR_K = int(os.getenv("ASK_EDGAR_K", "8"))
+# How many calls out from the cap the agent starts being told to wrap up.
+_ASK_EDGAR_WARN_AT = 5
+_ASK_EDGAR_CALLS = 0
+
+# Results by normalized expression, for the run. Whitespace only: two
+# expressions that differ in spacing are the same computation, while two
+# that differ in SCALE ("45183.036 - 39001.0" vs "45183036 - 39001000") are
+# deliberately kept apart even though they reduce to the same ratio — a
+# cache is not the place to assert that two differently-written derivations
+# are equivalent.
+_CALC_CACHE: dict[str, str] = {}
+_CALC_WHITESPACE = re.compile(r"\s+")
+
+
+def _normalize_expression(expression: str) -> str:
+    return _CALC_WHITESPACE.sub("", expression)
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +129,15 @@ TOOLS = [
             "Ask one specific question about SEC filings. Returns an answer "
             "with citations and source excerpts. Best for cross-section "
             "analysis, year-over-year comparisons, risk factors, MD&A "
-            "commentary, and segment breakdowns."
+            "commentary, and segment breakdowns.\n\n"
+            f"BUDGETED: you may call this at most {ASK_EDGAR_MAX_CALLS} times "
+            "in one analysis, and it is the most expensive tool available to "
+            "you. Plan the whole checklist against that number before "
+            "spending the first call — ask one broad question that covers "
+            "several checklist items rather than one narrow question per "
+            "item, and do not re-ask something an earlier answer already "
+            "told you. When the budget runs out you will be told to write "
+            "the memo from what you have."
         ),
         "input_schema": {
             "type": "object",
@@ -107,11 +178,21 @@ TOOLS = [
             "a zero total_on_sec with domestic form types searched does NOT "
             "mean the company has no SEC filings at all. Returns which "
             "filings are new and not yet ingested. Use this to ensure the "
-            "corpus has the most recent reports before running analysis."
+            "corpus has the most recent reports before running analysis.\n\n"
+            "By default this returns PERIODIC reports only (10-K/10-Q, or "
+            "20-F for foreign private issuers) — the financial statements a "
+            "checklist is built from. Event filings (8-K/6-K) are excluded "
+            "because they outnumber the periodic ones several times over and "
+            "would fill your context without informing the analysis. Pass "
+            "form_types explicitly, e.g. [\"8-K\"], on the rare occasion you "
+            "need a specific event filing."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {"ticker": {"type": "string"}},
+            "properties": {
+                "ticker": {"type": "string"},
+                "form_types": {"type": "array", "items": {"type": "string"}},
+            },
             "required": ["ticker"],
         },
     },
@@ -239,6 +320,129 @@ def _eval_node(node, scale_by_value: dict[float, float] | None = None):
     raise ValueError(f"disallowed expression element: {type(node).__name__}")
 
 
+def _strictify(schema: dict) -> dict:
+    """Rewrite a schema into the form strict tool-calling requires.
+
+    Both dialects want the same three things, recursively: every object
+    closed with `additionalProperties: false`, every declared property
+    listed in `required`, and anything genuinely optional expressed as
+    nullable rather than absent.
+
+    Done as a transformation rather than by hand-editing the schemas above
+    so the readable version stays the source of truth — the `required` list
+    there still says which arguments actually matter, and this only
+    restates it in the shape the API enforces.
+
+    Why bother when `_validate_tool_inputs` already catches a bad call: the
+    validator recovers from the mistake, strict prevents it. The run that
+    exposed all of this lost 376 seconds to one mis-named argument, and a
+    recovered tool call still costs a turn against LOOP_MAX_TURNS — which
+    the priciest runs already exhaust.
+
+    An optional property becomes `["<type>", "null"]`, and the dispatch
+    code reads those through `.get()`, so an explicit null behaves exactly
+    as the previously-absent key did.
+    """
+    if schema.get("type") != "object":
+        return schema
+
+    properties = schema.get("properties", {})
+    required = set(schema.get("required", []))
+    out_properties = {}
+
+    for name, prop in properties.items():
+        prop = dict(prop)
+        if prop.get("type") == "object":
+            prop = _strictify(prop)
+        elif prop.get("type") == "array" and isinstance(prop.get("items"), dict):
+            prop["items"] = _strictify(prop["items"])
+        if name not in required and "type" in prop and not isinstance(prop["type"], list):
+            prop["type"] = [prop["type"], "null"]
+        out_properties[name] = prop
+
+    return {
+        **schema,
+        "properties": out_properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+# Applied after the schemas above are declared, and `strict` set alongside.
+# Kept together so a tool added later cannot pick up one without the other:
+# `strict: true` on a schema that is not strict-compatible is a 400 on the
+# first call, not a quiet degradation.
+# Captured BEFORE the rewrite. `_strictify` lists every property in
+# `required` because that is what strict mode demands, but that is a wire
+# format, not the tool's real contract: `form_types` is still optional, and
+# a call that simply omits it must not be rejected as incomplete by our own
+# validator. So validation keeps asking the original question.
+_REQUIRED_BY_NAME = {
+    tool["name"]: list(tool["input_schema"].get("required", [])) for tool in TOOLS
+}
+
+for _tool in TOOLS:
+    _tool["input_schema"] = _strictify(_tool["input_schema"])
+    _tool["strict"] = True
+
+# ---------------------------------------------------------------------------
+# Argument validation
+# ---------------------------------------------------------------------------
+
+_SCHEMA_BY_NAME = {tool["name"]: tool["input_schema"] for tool in TOOLS}
+
+
+def _validate_tool_inputs(name: str, inputs: dict) -> str | None:
+    """Check a tool call's arguments against its own schema before dispatch.
+
+    Returns an error message for the model, or None when the call is fine.
+
+    Exists because a mis-named argument used to kill the whole run. Every
+    other failure inside `_dispatch` comes back as a STRING the model can
+    read and react to — a non-200 from the API, a rejected expression — but
+    the argument reads were bare subscripts, so `check_latest_filings`
+    called with `tickers=[...]` instead of `ticker="..."` raised a KeyError
+    that propagated out of `execute_tool` and ended a 376-second run at the
+    tool call. Nothing about that is provider-specific; it had simply never
+    been the failing model's mistake before.
+
+    The plural/singular split is the trap that sprang it: `ask_edgar` takes
+    `tickers` (a list) and every other tool takes `ticker` (a string), so a
+    model generalising from one call to the next gets it wrong in a way no
+    amount of prompt wording reliably prevents. Naming the accepted
+    arguments back to the model is what makes the next attempt succeed.
+
+    Unknown arguments are reported, not ignored: a call carrying `tickers`
+    would otherwise fail the `ticker` check with no hint about the list it
+    did send, and the model would have to guess what it got wrong.
+    """
+    schema = _SCHEMA_BY_NAME.get(name)
+    if schema is None:
+        return None
+
+    properties = schema.get("properties", {})
+    required = _REQUIRED_BY_NAME.get(name, [])
+    missing = [k for k in required if k not in inputs]
+    unknown = [k for k in inputs if k not in properties]
+    if not missing and not unknown:
+        return None
+
+    problems = []
+    if missing:
+        problems.append(f"missing required argument(s): {', '.join(sorted(missing))}")
+    if unknown:
+        problems.append(f"unexpected argument(s): {', '.join(sorted(unknown))}")
+
+    accepted = ", ".join(
+        f"{k} ({v.get('type', 'any')})" + ("" if k in required else ", optional")
+        for k, v in properties.items()
+    )
+    return (
+        f"Error: {name} was called with " + "; ".join(problems) + ". "
+        f"This tool accepts exactly: {accepted}. "
+        f"Re-issue the call with the correct argument names."
+    )
+
 # ---------------------------------------------------------------------------
 # Dispatch. Each branch prints its call/result so you can watch the agent
 # reason. Replace the stub branches in step 2.
@@ -251,6 +455,16 @@ USE_STUBS = False
 async def execute_tool(name: str, inputs: dict) -> str:
     print(f"  [tool call] {name}({inputs})")
     record_log_line(f"  [tool call] {name}({inputs})")
+
+    # Before dispatch, and returned WITHOUT recording into the provenance
+    # corpus: a rejected call retrieved nothing, and the corpus is what
+    # every numeric guard checks memo figures against.
+    problem = _validate_tool_inputs(name, inputs)
+    if problem:
+        print(f"  [tool result] {problem}", file=sys.stderr)
+        record_log_line(f"  [tool result] {problem}")
+        return problem
+
     result = await _dispatch(name, inputs)
 
     # Feed tool output into the provenance corpus so calculate() can verify
@@ -281,15 +495,63 @@ async def execute_tool(name: str, inputs: dict) -> str:
 
 async def _dispatch(name: str, inputs: dict) -> str:
     if name == "calculate":
-        err = validate_calculate_inputs(
-            inputs["expression"], inputs.get("inputs", [])
-        )
+        expression = inputs["expression"]
+        # Validation runs on EVERY call, cache hit or not. It checks the
+        # supplied `inputs` have provenance, and a repeat can arrive with
+        # different — possibly worse — inputs than the call that populated
+        # the cache. Short-circuiting before this would let the second call
+        # launder the first one's provenance.
+        err = validate_calculate_inputs(expression, inputs.get("inputs", []))
         if err:
-            record_rejected_calc(inputs["expression"], inputs.get("inputs", []), err)
+            record_rejected_calc(expression, inputs.get("inputs", []), err)
             return err
-        result = safe_calculate(inputs["expression"], inputs.get("inputs", []))
+
+        key = _normalize_expression(expression)
+        if key in _CALC_CACHE:
+            # Note honestly what this does and does not save. `calculate` is
+            # pure Python with no API call, so the direct cost of a repeat is
+            # ~zero and was already paid before this function ran: the
+            # expensive part is the agent TURN, a full context round-trip
+            # (~22k cache-read tokens, ~$0.0022) spent to reach this line.
+            # Memoisation cannot refund that. What it can do is tell the
+            # agent it is repeating itself, which is a behavioural nudge
+            # against the NEXT duplicate. Measured cause: NFLX ran
+            # "10149273 - 688220" three times and one growth-rate expression
+            # twice in a single run (Phase 9 cost audit).
+            #
+            # The note carries no digits of its own, so it adds nothing to
+            # the provenance corpus the containment guards scan.
+            return (
+                f"{_CALC_CACHE[key]}  [already computed earlier this run — "
+                f"identical expression, identical result. Check your earlier "
+                f"working before re-deriving a figure.]"
+            )
+
+        result = safe_calculate(expression, inputs.get("inputs", []))
         record_calc_result(result)
+        _CALC_CACHE[key] = result
         return result
+
+    # Budget check BEFORE any transport is set up. A refused call has to
+    # cost nothing at all -- that is the whole point of it -- and putting
+    # the check inside the HTTP context meant a refusal still built a
+    # client. Caught by test_the_refusal_makes_no_http_call.
+    if name == "ask_edgar":
+        global _ASK_EDGAR_CALLS
+        if _ASK_EDGAR_CALLS >= ASK_EDGAR_MAX_CALLS:
+            # Refuse rather than raise: the agent's correct response is to
+            # write the memo from what it has, exactly as it does at
+            # MAX_TURNS. An exception would lose the whole run's work over a
+            # budget that is a preference, not a failure.
+            return (
+                f"BUDGET EXHAUSTED: you have used all "
+                f"{ASK_EDGAR_MAX_CALLS} of your ask_edgar calls for this "
+                f"analysis. No further filing queries are available. Write "
+                f"the memo now from what you have already gathered, and "
+                f"record any checklist item you could not complete as an "
+                f"explicit data gap rather than leaving it unmentioned."
+            )
+        _ASK_EDGAR_CALLS += 1
 
     if USE_STUBS:
         return _stub(name, inputs)
@@ -323,17 +585,32 @@ async def _dispatch(name: str, inputs: dict) -> str:
                 json={
                     "question": inputs["question"],
                     "tickers": inputs.get("tickers"),
+                    "k": ASK_EDGAR_K,
                 },
             )
             if resp.status_code != 200:
                 return f"Error from /ask: {resp.status_code} — {resp.text[:500]}"
-            
+            _record_delegated_usage(resp)
+
             data = resp.json()
             citations = "\n".join(
                 f"  [{c['citation']}] sim={c['similarity']:.3f}"
                 for c in data.get("chunks", [])
             )
             out = f"{data['answer']}\n\nSources:\n{citations}"
+            remaining = ASK_EDGAR_MAX_CALLS - _ASK_EDGAR_CALLS
+            if remaining <= _ASK_EDGAR_WARN_AT:
+                # Only inside the warn band. Appending a counter to all 30
+                # answers would put a changing number into every tool result,
+                # and tool results are the agent's provenance corpus -- the
+                # containment guards scan it for figures that "back" memo
+                # claims. Five lines of budget text is a cost worth paying;
+                # thirty is not.
+                out += (
+                    f"\n\n[BUDGET] {remaining} ask_edgar call(s) remaining of "
+                    f"{ASK_EDGAR_MAX_CALLS}. Prioritise the checklist items "
+                    f"you have not yet covered."
+                )
             if data.get("unverified"):
                 out += (
                     f"\n\nWARNING — these figures in the above answer do not "
@@ -347,13 +624,18 @@ async def _dispatch(name: str, inputs: dict) -> str:
             resp = await http.post(f"{API_BASE}/extract", json=inputs)
             if resp.status_code != 200:
                 return f"Error from /extract_metrics: {resp.status_code} — {resp.text[:500]}"
+            _record_delegated_usage(resp)
             return resp.text
 
         if name == "check_latest_filings":
-            resp = await http.post(
-                f"{API_BASE}/latest-filings",
-                json={"ticker": inputs["ticker"]},
-            )
+            payload = {"ticker": inputs["ticker"]}
+            # Passed through only when the agent named its forms. Omitting
+            # the key lets the server auto-detect the filer's family and
+            # narrow it to periodic reports; sending form_types=None would
+            # be the same thing but makes the wire format depend on a null.
+            if inputs.get("form_types"):
+                payload["form_types"] = inputs["form_types"]
+            resp = await http.post(f"{API_BASE}/latest-filings", json=payload)
             if resp.status_code != 200:
                 return f"Error from /latest-filings: {resp.status_code} — {resp.text[:500]}"
             return resp.text
@@ -530,12 +812,49 @@ _CALC_RESULTS: list[float] = []
 _REJECTED_CALC_ATTEMPTS: list[dict] = []
 _SESSION_LOG: list[str] = []
 
+_DELEGATED_USAGE = TokenUsage()
+
+
 def reset_run_provenance() -> None:
     """Call once at the start of each agent run."""
+    global _DELEGATED_USAGE, _ASK_EDGAR_CALLS
     _RETRIEVED_TEXT.clear()
     _CALC_RESULTS.clear()
     _REJECTED_CALC_ATTEMPTS.clear()
     _SESSION_LOG.clear()
+    _DELEGATED_USAGE = TokenUsage()
+    _ASK_EDGAR_CALLS = 0
+    _CALC_CACHE.clear()
+
+
+def _record_delegated_usage(resp) -> None:
+    """Accumulate what the API says a tool call cost.
+
+    The agent's tools are HTTP calls to the FastAPI app, and several of them
+    (`ask_edgar`, `extract_metrics`) run their own Claude calls server-side.
+    Until 2026-08-27 that spend reached nothing: not the cost log, not
+    `TradingState.cost_events`, and so not `check_run_guards` -- measured at
+    ~28% of a real fundamentals run, enough for AVGO to exceed its $1.10 cap
+    unnoticed. The server reports; the caller accounts, because only the
+    caller knows the run_id.
+
+    A missing or malformed header is treated as zero rather than an error:
+    an older server, or one of the endpoints that spends nothing, should not
+    break a run over accounting.
+    """
+    global _DELEGATED_USAGE
+    raw = resp.headers.get(USAGE_HEADER)
+    if not raw:
+        return
+    try:
+        _DELEGATED_USAGE = _DELEGATED_USAGE + TokenUsage.model_validate_json(raw)
+    except ValidationError:
+        logger.warning("ignoring malformed %s header: %r", USAGE_HEADER, raw[:120])
+
+
+def get_delegated_usage() -> TokenUsage:
+    """Total server-side spend since the last `reset_run_provenance()`."""
+    return _DELEGATED_USAGE
 
 def record_log_line(text: str) -> None:
     """Append a line to the run's session log — the full terminal trace

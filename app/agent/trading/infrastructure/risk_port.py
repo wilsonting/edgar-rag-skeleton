@@ -24,12 +24,11 @@ import sys
 from pathlib import Path
 from typing import Literal
 
-from anthropic import AsyncAnthropic
+from app.infrastructure.llm import LLMClient, get_client
+from app.infrastructure.llm.models import model_for, warn_if_unpriced
 from pydantic import ValidationError
 
 from app.agent.researcher import (
-    AGENT_MODEL,
-    _MODEL_PRICING,
     UsageSummary,
     _save_output,
     log_cost,
@@ -37,6 +36,8 @@ from app.agent.researcher import (
 from app.agent.trading.application.risk_ledger import build_slate, contested_ids
 from app.agent.trading.application.risk_router import RISK_MAX_TURNS
 from app.agent.trading.domain.debate import DebateTurn, canonical_claims
+from app.agent.trading.domain.sanitize import EXTERNAL_TEXT_FRAMING
+from app.agent.trading.infrastructure.cost_log import new_event_id, record_cost_event
 from app.agent.trading.domain.risk import (
     PERSONAS,
     Persona,
@@ -58,7 +59,7 @@ from app.agent.trading.infrastructure.debate_port import (
 Phase = Literal["enumerate", "score", "adjudicate", "respond"]
 
 # The project-wide model from .env, same override pattern as DEBATE_MODEL.
-RISK_MODEL = os.getenv("TRADING_RISK_MODEL") or AGENT_MODEL
+RISK_MODEL = model_for("risk_panel")
 
 RISK_MAX_TOKENS = 4000
 
@@ -69,12 +70,7 @@ RISK_MAX_TOKENS = 4000
 # against a linear extrapolation.
 RISK_BUDGET_USD = 0.35
 
-if RISK_MODEL not in _MODEL_PRICING:
-    print(
-        f"[risk] WARNING: no pricing configured for {RISK_MODEL} — per-turn "
-        f"costs will log as null and the ${RISK_BUDGET_USD:.2f} budget "
-        f"assertion cannot fire. Add it to _MODEL_PRICING in researcher.py."
-    )
+warn_if_unpriced(RISK_MODEL, "risk", RISK_BUDGET_USD)
 
 # Forced-failure hooks for the resume tests, mirroring DEBATE_CRASH_AT_TURN.
 _CRASH_AT = os.getenv("RISK_CRASH_AT_TURN")
@@ -176,6 +172,8 @@ equity position, run AFTER a bull/bear debate over the same evidence.
 You will be given an EVIDENCE PACK (the analyst reports and the debate
 transcript) and the risk panel's transcript so far.
 
+{EXTERNAL_TEXT_FRAMING}
+
 HARD RULES — checked in code after you answer:
 
 1. EVERY figure you write in `argument` or a score's `rationale` must appear
@@ -196,15 +194,27 @@ HARD RULES — checked in code after you answer:
    slate (or contested-ids list). A score for an id not on the list is
    dropped and flagged, not silently accepted.
 
-{PHASE}
+Each turn's user message tells you which phase you're in (enumerate, score,
+adjudicate, or respond) and what that phase specifically requires — follow
+those instructions for the current turn.
 
 Call `submit_risk_turn` exactly once. Say nothing else."""
 
 
-def _build_system(persona: Persona, phase: Phase) -> str:
+def _build_system(persona: Persona) -> str:
+    """Deliberately NOT a function of `phase` (cost fix, Phase 8 follow-up):
+    the phase text used to be baked in here, which meant round 1
+    (enumerate/score) and round 2+ (adjudicate/respond) always produced a
+    DIFFERENT cached prefix per persona — a guaranteed cache miss on every
+    phase transition, live-measured as ~2 of every 3 rounds paying full
+    price instead of reading a 90%-cheaper cache hit. `_PHASE_INSTRUCTIONS`
+    now goes in the per-turn user message instead (build_risk_evidence_pack
+    already isn't phase-dependent either), so the cached prefix — stance +
+    evidence pack — is stable across a persona's ENTIRE panel, not just
+    within one phase."""
     return (
         _SYSTEM_TEMPLATE.replace("{STANCE}", _STANCE_BY_PERSONA[persona])
-        .replace("{PHASE}", _PHASE_INSTRUCTIONS[phase])
+        .replace("{EXTERNAL_TEXT_FRAMING}", EXTERNAL_TEXT_FRAMING)
     )
 
 
@@ -381,7 +391,7 @@ def _check_turn(
 # ---------------------------------------------------------------------------
 
 async def _submit(
-    client: AsyncAnthropic, system_blocks: list[dict], messages: list[dict],
+    client: LLMClient, system_blocks: list[dict], messages: list[dict],
     temperature: float | None = None,
 ):
     return await create_with_temperature_fallback(
@@ -541,7 +551,7 @@ def _assemble(
 
 
 async def run_risk_turn(
-    state, persona: Persona, turn_index: int, client: AsyncAnthropic | None = None,
+    state, persona: Persona, turn_index: int, client: LLMClient | None = None,
     temperature: float | None = None,
 ) -> RiskTurn:
     """One turn: build the pack, make one forced tool call, run the guards.
@@ -569,10 +579,10 @@ async def run_risk_turn(
     texts = report_texts(state)
     debate_corpus = _debate_claim_corpus(debate_turns)
     pack = build_risk_evidence_pack(state)
-    client = client or AsyncAnthropic()
+    client = client or get_client(RISK_MODEL)
 
     system_blocks = [
-        {"type": "text", "text": _build_system(persona, phase)},
+        {"type": "text", "text": _build_system(persona)},
         {"type": "text", "text": pack, "cache_control": {"type": "ephemeral"}},
     ]
     id_line = (
@@ -586,6 +596,7 @@ async def run_risk_turn(
         f"{render_risk_transcript(turns)}\n\n{id_line}\n\n"
         f"You are the {persona.upper()} panelist. This is turn {turn_index} "
         f"(round {(turn_index // len(PERSONAS)) + 1}, phase={phase}). "
+        f"{_PHASE_INSTRUCTIONS[phase]}\n\n"
         f"Submit your contribution now."
     )
     messages: list[dict] = [{"role": "user", "content": user_text}]
@@ -610,8 +621,11 @@ async def run_risk_turn(
 
     turn, truncated = _assemble(payload, turn_index, persona, slate)
 
+    node_name = f"{persona}_turn"
+    event_id = new_event_id(node_name, turn_index=turn_index)
     cost = log_cost(
-        ticker, f"trading-risk-{persona}-r{(turn_index // len(PERSONAS)) + 1}", usage, model=RISK_MODEL
+        ticker, f"trading-risk-{persona}-r{(turn_index // len(PERSONAS)) + 1}", usage,
+        model=RISK_MODEL, run_id=state.get("run_id"), event_id=event_id,
     )
     _assert_within_budget(ticker, turns, cost)
 
@@ -630,6 +644,7 @@ async def run_risk_turn(
     turn.input_tokens = usage.input_tokens
     turn.output_tokens = usage.output_tokens
     turn.estimated_cost_usd = cost
+    turn.cost_event = record_cost_event(event_id, node_name, usage, RISK_MODEL, cost)
 
     _maybe_crash(turn_index, "after")
     return turn

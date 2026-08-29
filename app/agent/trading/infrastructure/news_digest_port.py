@@ -5,9 +5,16 @@ import json
 from pathlib import Path
 from typing import Any
 
-from anthropic import AsyncAnthropic
+from app.infrastructure.llm import LLMClient, get_client
+from app.infrastructure.llm.models import model_for, warn_if_unpriced
 
-from app.agent.researcher import AGENT_MODEL, UsageSummary, _save_output, log_cost
+# Its own knob (TRADING_NEWS_DIGEST_MODEL), defaulting to the
+# project-wide model — which is all this role had before.
+NEWS_DIGEST_MODEL = model_for("news_digest")
+warn_if_unpriced(NEWS_DIGEST_MODEL, "news")
+
+from app.agent.researcher import UsageSummary, _save_output, log_cost
+from app.agent.trading.domain.budget import CostEvent
 from app.agent.trading.domain.errors import VendorError
 from app.agent.trading.domain.news_digest import (
     AGGREGATED_RELEVANCE,
@@ -15,9 +22,17 @@ from app.agent.trading.domain.news_digest import (
     NewsItem,
     SentimentSummary,
 )
+from app.agent.trading.domain.sanitize import EXTERNAL_TEXT_FRAMING, sanitize_external_text
+from app.agent.trading.infrastructure.cost_log import new_event_id, record_cost_event
 
 BATCH_SIZE = 15
-DIGEST_MAX_TOKENS = 1500
+# Sized against Haiku's output profile with no headroom, which is how a
+# provider that reasons before answering broke it: a batch that overruns
+# does not come back short, it comes back as unparseable JSON, and a batch
+# that fails is 15 articles silently absent from the digest. Measured on a
+# full 15-article batch with reasoning off: ~630-680 output tokens. 3000
+# is deliberate slack over that, and costs nothing unless it is used.
+DIGEST_MAX_TOKENS = 3000
 NEWS_BUDGET_USD = 0.20
 # Enough parallelism to keep a full-cap run (20 batches) to a few waves,
 # low enough not to arrive as one burst against the account's rate limit.
@@ -31,7 +46,9 @@ VALID_RELEVANCE = {"primary", "mentioned", "unrelated"}
 # vendor metadata by index. The model never emits a headline, a date, a
 # source, or a URL — same move that fixed sbc_pct_of_revenue: don't let the
 # model retype data it can copy wrong.
-SYSTEM_PROMPT = """You summarize financial news articles for an equity research pipeline.
+SYSTEM_PROMPT = f"""You summarize financial news articles for an equity research pipeline.
+
+{EXTERNAL_TEXT_FRAMING}
 
 The user message names one COMPANY UNDER ANALYSIS, then gives numbered articles
 marked [N]. The articles come from a vendor feed tagged with that company's
@@ -72,6 +89,28 @@ Other rules:
 """
 
 
+def _sanitize_articles(
+    articles: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Strips control/invisible characters, caps length, and flags
+    instruction-like patterns in the vendor's raw `headline`/`summary`
+    fields — the ONE place this happens, before either `_render_batch`
+    (the prompt) or `_join` (NewsItem construction, i.e. TradingState) ever
+    reads them. Everything downstream of this function sees only sanitized
+    text.
+    """
+    sanitized: list[dict[str, Any]] = []
+    flags: list[str] = []
+    for a in articles:
+        source = a.get("source", "unknown")
+        headline = sanitize_external_text(a.get("headline") or "", source=source)
+        body = sanitize_external_text(a.get("summary") or "", source=source)
+        for f in headline.flags + body.flags:
+            flags.append(f"{(a.get('headline') or '')[:60]!r}: {f}")
+        sanitized.append({**a, "headline": headline.body, "summary": body.body})
+    return sanitized, flags
+
+
 def _render_batch(articles: list[dict[str, Any]], ticker: str) -> str:
     """The ticker heads the batch because relevance and sentiment are both
     judged against it. Without it the model scored each article against
@@ -85,10 +124,10 @@ def _render_batch(articles: list[dict[str, Any]], ticker: str) -> str:
 
 
 async def _summarize_batch(
-    client: AsyncAnthropic, articles: list[dict[str, Any]], ticker: str
+    client: LLMClient, articles: list[dict[str, Any]], ticker: str
 ) -> tuple[list[dict[str, Any]], Any]:
     resp = await client.messages.create(
-        model=AGENT_MODEL,
+        model=NEWS_DIGEST_MODEL,
         max_tokens=DIGEST_MAX_TOKENS,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": _render_batch(articles, ticker)}],
@@ -137,6 +176,35 @@ def _parse_index(raw: Any) -> int:
     raise TypeError(f"index of type {type(raw).__name__}")
 
 
+def _unwrap_nested(parsed: list[Any]) -> list[Any]:
+    """Splice a batch the model wrapped in an extra array.
+
+    Observed live (ASML, 2026-08-29, deepseek-v4-flash): one batch came back
+    as [[{...}, {...}, ...]] rather than [{...}, {...}, ...]. The outer list
+    passes the "is it an array" check in `_summarize_batch`, so it reached
+    `_join`, where `obj["index"]` on a list raises TypeError — every article
+    in that batch was flagged "unparseable index" and dropped. Seven real
+    stories, and the digest then scored ASML off the five that survived.
+
+    Unwrapped rather than rejected for the same reason `_parse_index`
+    tolerates "[0]": the nesting is unambiguous, and the alternative is
+    losing articles the model actually summarised correctly. One level only
+    — anything deeper still falls through to the per-object checks below and
+    is flagged there, so a genuinely malformed response cannot ride in on
+    this.
+
+    Not recorded as an issue when it succeeds: `issues` exists to make DATA
+    LOSS visible, and a fully recovered batch lost nothing.
+    """
+    out: list[Any] = []
+    for obj in parsed:
+        if isinstance(obj, list):
+            out.extend(obj)
+        else:
+            out.append(obj)
+    return out
+
+
 def _join(
     articles: list[dict[str, Any]], parsed: list[dict[str, Any]]
 ) -> tuple[list[NewsItem], list[str]]:
@@ -151,7 +219,7 @@ def _join(
     by_index: dict[int, dict[str, Any]] = {}
     issues: list[str] = []
 
-    for obj in parsed:
+    for obj in _unwrap_nested(parsed):
         try:
             idx = _parse_index(obj["index"])
         except (KeyError, TypeError, ValueError):
@@ -214,13 +282,13 @@ def _assert_within_budget(cost: float | None) -> None:
     if cost is not None and cost > NEWS_BUDGET_USD:
         raise AssertionError(
             f"news digest cost ${cost:.4f} exceeds the ${NEWS_BUDGET_USD:.2f} "
-            f"per-run budget — check AGENT_MODEL routing before rerunning"
+            f"per-run budget — check TRADING_NEWS_DIGEST_MODEL routing before rerunning"
         )
 
 
 async def build_digest(
-    articles: list[dict[str, Any]], ticker: str
-) -> tuple[list[NewsItem], list[str], float | None]:
+    articles: list[dict[str, Any]], ticker: str, run_id: str | None = None
+) -> tuple[list[NewsItem], list[str], float | None, CostEvent | None, list[str]]:
     """Batch the cleaned articles through Haiku and join by index.
 
     Batches run concurrently. At MAX_ARTICLES a run is 20 calls, and issuing
@@ -233,9 +301,11 @@ async def build_digest(
     per-run budget check doesn't have to reassemble per-batch lines.
     """
     if not articles:
-        return [], [], None
+        return [], [], None, None, []
 
-    client = AsyncAnthropic()
+    articles, sanitizer_flags = _sanitize_articles(articles)
+
+    client = get_client(NEWS_DIGEST_MODEL)
     usage = UsageSummary()
     items: list[NewsItem] = []
     issues: list[str] = []
@@ -291,9 +361,11 @@ async def build_digest(
             f"refusing to return an empty digest that would read as no news"
         )
 
-    cost = log_cost(ticker, "trading-news", usage)
+    event_id = new_event_id("news")
+    cost = log_cost(ticker, "trading-news", usage, run_id=run_id, event_id=event_id)
     _assert_within_budget(cost)
-    return items, issues, cost
+    cost_event = record_cost_event(event_id, "news", usage, NEWS_DIGEST_MODEL, cost)
+    return items, issues, cost, cost_event, sanitizer_flags
 
 
 def _format_sentiment_markdown(

@@ -46,8 +46,8 @@ async def test_technical_node_never_reports_a_date_after_as_of(monkeypatch):
 
     monkeypatch.setattr(pdp.yf, "Ticker", _FakeTicker)
 
-    async def fake_interpret(ticker, indicators):
-        return "stub interpretation, no numbers.", [], [], None
+    async def fake_interpret(ticker, indicators, run_id=None):
+        return "stub interpretation, no numbers.", [], [], None, None
 
     monkeypatch.setattr(nodes, "interpret_indicators", fake_interpret)
     monkeypatch.setattr(nodes, "save_technical_report", lambda report, cost_usd=None: None)

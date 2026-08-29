@@ -55,6 +55,12 @@ ALLOWED_MSGPACK_MODULES = [
     ("app.agent.trading.domain.risk", "RiskScore"),
     ("app.agent.trading.domain.risk", "RiskTurnPayload"),
     ("app.agent.trading.domain.risk", "RiskTurn"),
+    # Phase 8. RunTermination is a plain str Enum (same registration need as
+    # Verdict above) — RunBudget and CostEvent are BaseModels like every
+    # other entry here.
+    ("app.agent.trading.domain.budget", "RunBudget"),
+    ("app.agent.trading.domain.budget", "CostEvent"),
+    ("app.agent.trading.domain.budget", "RunTermination"),
 ]
 
 

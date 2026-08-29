@@ -5,7 +5,9 @@ import os
 from pathlib import Path
 from typing import Literal
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
+
+from app.domain.token_usage import USAGE_HEADER, TokenUsage
 from pydantic import BaseModel, Field
 from datetime import date, timedelta
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,7 +24,8 @@ from app.application.query_decomposer import QueryDecomposer
 from app.application.retrieval_service import RetrievalService
 from app.application.citations import format_citation_tag
 
-from app.infrastructure.edgar.client import EdgarClient
+from app.infrastructure.llm.models import model_for
+from app.infrastructure.edgar.client import EdgarClient, periodic_forms
 from app.infrastructure.edgar.ticker_resolver import TickerResolver
 from app.infrastructure.queries.corpus_status import CorpusStatusQuery
 from app.infrastructure.repositories import metrics_repo
@@ -42,7 +45,7 @@ from app.llm import answer_question
 
 load_dotenv(override=True)
 logging.basicConfig(level=logging.INFO)
-claude_model = os.getenv("LLM_CLAUDE_MODEL")
+claude_model = model_for("answer")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -128,10 +131,38 @@ class LatestFilingsRequest(BaseModel):
     # None = auto-detect the filer's form-type family (see IngestRequest).
     form_types: list[str] | None = None
     since_year: int | None = None
+    # Narrow the auto-detected family to its PERIODIC members (10-K/10-Q, or
+    # 20-F), dropping the event-driven ones. Defaults on because a
+    # fundamentals checklist is built from periodic reports and the event
+    # filings dominate the list by count -- NFLX returned 44 filings of which
+    # 38 were 8-Ks, and every one of them then rode in the agent's context
+    # for the rest of the run. Ignored when `form_types` is given explicitly:
+    # a caller naming its forms has already said what it wants.
+    periodic_only: bool = True
 
 # ---- Endpoint ----
+def _report_usage(response: Response, *usages: TokenUsage) -> None:
+    """Tell the caller what this request spent, in a header.
+
+    A header and not a body field: the research agent copies tool-result
+    bodies verbatim into its provenance corpus, and every numeric guard in
+    the trading pipeline does exact containment against that corpus. Four
+    token counts added to each retrieval body would be four new numbers that
+    could then "back" a figure in a memo. The header leaves the
+    agent-visible bytes exactly as they were.
+
+    The caller does the logging, not this server: only it knows the run_id,
+    and only its TradingState feeds `check_run_guards`. See
+    domain/token_usage.py.
+    """
+    total = TokenUsage()
+    for usage in usages:
+        total = total + usage
+    response.headers[USAGE_HEADER] = total.model_dump_json()
+
+
 @app.post("/ask",  response_model=AskResponse)
-async def ask(req: AskRequest) -> AskResponse:
+async def ask(req: AskRequest, response: Response) -> AskResponse:
     if not req.question.strip():
         raise HTTPException(400, "question must not be empty")
 
@@ -152,11 +183,13 @@ async def ask(req: AskRequest) -> AskResponse:
         section_path_contains=req.section_path_contains,
     )
 
-    chunks, _decomposition = await retrieval.retrieve_full(req.question, k=req.k, filters=filters)
+    chunks, decomposition = await retrieval.retrieve_full(req.question, k=req.k, filters=filters)
     result = await answer_question(
         question=req.question, 
         chunks=chunks,
         model=claude_model)
+    # BOTH calls: the decomposer's rewrite is billed just like the answer.
+    _report_usage(response, result.usage, decomposition.usage)
 
     report = verify_answer(
         result.answer,
@@ -184,7 +217,7 @@ async def ask(req: AskRequest) -> AskResponse:
 
 
 @app.post("/extract", response_model=FinancialMetrics)
-async def extract(req: ExtractRequest) -> FinancialMetrics:
+async def extract(req: ExtractRequest, response: Response) -> FinancialMetrics:
     embedder = EmbeddingService()
     chunk_repo = ChunkRepository()
     decomposer = QueryDecomposer()
@@ -201,6 +234,12 @@ async def extract(req: ExtractRequest) -> FinancialMetrics:
     window_end = req.filed_date + timedelta(days=30)
     chunks = await gather_extraction_chunks(retrieval, req.ticker, window_start, window_end)
     extracted = await extractor.extract(chunks, req.ticker, req.fiscal_period, req.filing_type, req.filed_date)
+    # `gather_extraction_chunks` runs retrieval, which may invoke the
+    # decomposer; that path does not surface a DecompositionResult here, so
+    # only the extraction call is reported. Under-reporting by the
+    # decomposer's share is the conservative direction and is noted rather
+    # than silently accepted -- see trading-agent-known-gaps.md.
+    _report_usage(response, extractor.last_usage)
     from app.infrastructure.repositories.metrics_repo import FinancialMetrics as MetricsRow
     row = MetricsRow(
         ticker=req.ticker,
@@ -290,6 +329,8 @@ async def latest_filings_endpoint(req: LatestFilingsRequest):
         form_types = req.form_types
         if form_types is None:
             form_types = await edgar.default_form_types(cik)
+            if req.periodic_only:
+                form_types = periodic_forms(form_types)
 
         since = date(req.since_year, 1, 1) if req.since_year else None
         sec_filings = await edgar.list_filings(

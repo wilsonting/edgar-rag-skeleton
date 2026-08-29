@@ -3,10 +3,18 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from anthropic import AsyncAnthropic
+from app.infrastructure.llm import get_client
+from app.infrastructure.llm.models import model_for, warn_if_unpriced
 
-from app.agent.researcher import AGENT_MODEL, UsageSummary, _save_output, log_cost
+# Its own knob (TRADING_TECHNICAL_MODEL), defaulting to the
+# project-wide model — which is all this role had before.
+TECHNICAL_MODEL = model_for("technical")
+warn_if_unpriced(TECHNICAL_MODEL, "technical")
+
+from app.agent.researcher import UsageSummary, _save_output, log_cost
+from app.agent.trading.domain.budget import CostEvent
 from app.agent.trading.domain.technical_report import TechnicalIndicators, TechnicalReport
+from app.agent.trading.infrastructure.cost_log import new_event_id, record_cost_event
 
 TECHNICAL_INTERPRETER_SYSTEM_PROMPT = """\
 You are a technical analysis interpreter. You will be given a set of already-computed
@@ -103,9 +111,9 @@ def derive_relations(ind: TechnicalIndicators) -> list[str]:
 
 
 async def interpret_indicators(
-    ticker: str, indicators: TechnicalIndicators
-) -> tuple[str, list[str], list[str], float | None]:
-    client = AsyncAnthropic()
+    ticker: str, indicators: TechnicalIndicators, run_id: str | None = None
+) -> tuple[str, list[str], list[str], float | None, CostEvent]:
+    client = get_client(TECHNICAL_MODEL)
     relations = "\n".join(f"- {r}" for r in derive_relations(indicators))
     prompt = (
         f"Ticker: {ticker}\n"
@@ -115,8 +123,11 @@ async def interpret_indicators(
         "Provide the interpretation now."
     )
     response = await client.messages.create(
-        model=AGENT_MODEL,
-        max_tokens=512,
+        model=TECHNICAL_MODEL,
+        # 512 left no room for a model that reasons first: the live ACN/MSFT
+        # runs returned an EMPTY interpretation under its own heading, which
+        # reads as "nothing to say" rather than as a failure.
+        max_tokens=1200,
         system=TECHNICAL_INTERPRETER_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -128,11 +139,13 @@ async def interpret_indicators(
     usage.cache_write_tokens = u.cache_creation_input_tokens
     usage.cache_read_tokens = u.cache_read_input_tokens
     usage.output_tokens = u.output_tokens
-    cost = log_cost(ticker, "trading-technical", usage)
+    event_id = new_event_id("technical")
+    cost = log_cost(ticker, "trading-technical", usage, run_id=run_id, event_id=event_id)
+    cost_event = record_cost_event(event_id, "technical", usage, TECHNICAL_MODEL, cost)
 
     flagged = _flag_unmatched_numbers(interpretation, indicators)
     flagged_claims = flag_contradicted_claims(interpretation, indicators)
-    return interpretation, flagged, flagged_claims, cost
+    return interpretation, flagged, flagged_claims, cost, cost_event
 
 
 # A claim that something is above/below an N-day average. Non-greedy up to the

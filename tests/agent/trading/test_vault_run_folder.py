@@ -19,6 +19,8 @@ from app.agent.trading.domain.decision_memo import DecisionMemo, Verdict
 from app.agent.trading.domain.news_digest import NewsDigest, NewsItem, SentimentSummary
 from app.agent.trading.domain.technical_report import TechnicalIndicators, TechnicalReport
 from app.agent.trading.infrastructure.debate_port import save_debate_transcript
+from app.agent.trading.infrastructure.decision_memo_port import save_failed_decision_memo
+from app.agent.trading.infrastructure.synthesis_port import MemoVerification
 from app.agent.trading.infrastructure.technical_interpreter_port import (
     save_technical_report,
 )
@@ -167,3 +169,30 @@ def test_a_partial_run_writes_only_what_it_produced(tmp_path, monkeypatch):
         "ACN-technical.md",
     ]
     assert (run_dir / "ACN-decision-provenance.md").read_text() == "the captured run log"
+
+
+def test_a_failed_verification_memo_saves_from_inside_the_graph_with_a_banner(
+    tmp_path, monkeypatch
+):
+    """save_failed_decision_memo (Phase 7) follows the same mid-graph save
+    pattern as save_technical_report — called from synthesizer_node while
+    the graph is still executing, not from the CLI after ainvoke returns —
+    and lands in the SAME run folder, distinctly named so it never
+    collides with a successful ACN-decision.md."""
+    monkeypatch.setattr(researcher, "MEMO_DIR", tmp_path)
+    verification = MemoVerification(
+        passed=False, unbacked_numbers=["91.4"], unresolved_references=["RF99"],
+    )
+
+    with researcher.vault_run(STARTED):
+        path = save_failed_decision_memo(_memo(), verification)
+
+    run_dir = tmp_path / "ACN" / "20260822" / "2026-0822-070153"
+    assert path == run_dir / "ACN-decision-FAILED.md"
+    content = path.read_text()
+    assert "VERIFICATION FAILED" in content
+    assert "91.4" in content
+    assert "RF99" in content
+    # no provenance sidecar — same as technical_node's mid-graph save, and
+    # for the same reason: no captured run log exists yet at this point
+    assert not (run_dir / "ACN-decision-FAILED-provenance.md").exists()

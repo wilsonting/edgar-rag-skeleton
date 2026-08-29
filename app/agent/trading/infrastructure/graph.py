@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from langgraph.graph import StateGraph, START, END
 
 from app.agent.trading.application.debate_nodes import (
@@ -6,8 +8,10 @@ from app.agent.trading.application.debate_nodes import (
     debate_close_node,
 )
 from app.agent.trading.application.debate_router import next_debate_step
+from app.agent.trading.application.guards import check_run_guards
 from app.agent.trading.application.nodes import (
     fundamentals_node,
+    graceful_abort_node,
     technical_node,
     news_node,
     sentiment_node,
@@ -21,6 +25,33 @@ from app.agent.trading.application.risk_nodes import (
 )
 from app.agent.trading.application.risk_router import next_risk_step
 from app.agent.trading.domain.trading_state import TradingState
+
+
+def _guarded(inner):
+    """Wraps a router (or a bare next-node name, for what used to be a plain
+    edge) with the run-level budget/deadline check, run BEFORE the wrapped
+    router ever sees the state. Every LLM-calling node's incoming edge goes
+    through this — see build_trading_graph below — so a breach is reachable
+    from anywhere in the graph, independent of what debate_router.py/
+    risk_router.py would otherwise decide (see application/guards.py's
+    module docstring for why those stay untouched).
+
+    `budget` missing from state (every graph-level test invokes the graph
+    with just {ticker, as_of_date}, no budget) means this run opted out of
+    the guard entirely — not a breach. Only cli.py's real invocations set a
+    RunBudget, and only those are ever gated.
+    """
+    route = inner if callable(inner) else (lambda state: inner)
+
+    def router(state):
+        budget = state.get("budget")
+        if budget is not None:
+            events = state.get("cost_events") or []
+            if check_run_guards(events, budget, datetime.now(timezone.utc)) is not None:
+                return "abort"
+        return route(state)
+
+    return router
 
 # One entry per analyst as the CLI exposes it; the value is that analyst's
 # node chain in run order. "news" is two nodes because the deterministic
@@ -113,10 +144,21 @@ def build_trading_graph(checkpointer, interrupt_after=None, analysts=None):
         + risk_tail
     ):
         builder.add_node(name, fn)
+    builder.add_node("graceful_abort", graceful_abort_node)
 
+    # Phase 8: every edge into an LLM-calling node goes through _guarded(),
+    # which checks the run-level budget/deadline BEFORE the wrapped router
+    # ever runs and routes to "abort" on a breach — reachable from anywhere
+    # in the graph, independent of debate/risk-quality routing (see
+    # application/guards.py). The very first edge (START -> first analyst)
+    # is deliberately left plain: at t=0 with zero spend nothing can have
+    # breached yet, so guarding it would only add a router call that can
+    # never return "abort".
     builder.add_edge(START, analyst_chain[0][0])
     for (prev, _), (nxt, _) in zip(analyst_chain, analyst_chain[1:]):
-        builder.add_edge(prev, nxt)
+        builder.add_conditional_edges(
+            prev, _guarded(nxt), {nxt: nxt, "abort": "graceful_abort"}
+        )
 
     # The debate cycle's entry edge is conditional, same reasoning as Phase
     # 5: the router must see the state before the first turn runs, or the
@@ -124,9 +166,12 @@ def build_trading_graph(checkpointer, interrupt_after=None, analysts=None):
     # map including the never-taken same-side branch — if it ever fires,
     # the result is a visible loop the alternation assert in debate_nodes
     # then names precisely, not a KeyError deep in LangGraph routing.
-    debate_route_map = {"bull": "bull_turn", "bear": "bear_turn", "done": debate_tail[0][0]}
+    debate_route_map = {
+        "bull": "bull_turn", "bear": "bear_turn", "done": debate_tail[0][0],
+        "abort": "graceful_abort",
+    }
     for src in (analyst_chain[-1][0], "bull_turn", "bear_turn"):
-        builder.add_conditional_edges(src, next_debate_step, debate_route_map)
+        builder.add_conditional_edges(src, _guarded(next_debate_step), debate_route_map)
 
     for (prev, _), (nxt, _) in zip(debate_tail, debate_tail[1:]):
         builder.add_edge(prev, nxt)
@@ -139,13 +184,20 @@ def build_trading_graph(checkpointer, interrupt_after=None, analysts=None):
         "aggressive": "aggressive_turn",
         "conservative": "conservative_turn",
         "done": risk_tail[0][0],
+        "abort": "graceful_abort",
     }
     for src in (debate_tail[-1][0], "neutral_turn", "aggressive_turn", "conservative_turn"):
-        builder.add_conditional_edges(src, next_risk_step, risk_route_map)
+        builder.add_conditional_edges(src, _guarded(next_risk_step), risk_route_map)
 
     for (prev, _), (nxt, _) in zip(risk_tail, risk_tail[1:]):
-        builder.add_edge(prev, nxt)
+        # risk_close -> synthesizer today (risk_tail has exactly two
+        # entries) — synthesizer is an LLM-calling node, so this edge is
+        # guarded like every other one above.
+        builder.add_conditional_edges(
+            prev, _guarded(nxt), {nxt: nxt, "abort": "graceful_abort"}
+        )
     builder.add_edge(risk_tail[-1][0], END)
+    builder.add_edge("graceful_abort", END)
 
     return builder.compile(
         checkpointer=checkpointer, interrupt_after=interrupt_after or []

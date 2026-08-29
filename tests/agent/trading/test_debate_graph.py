@@ -98,7 +98,7 @@ def _stub_debate(monkeypatch, *, productive=True, cost=0.01):
 
 
 def _stub_fundamentals(monkeypatch):
-    async def fake(ticker: str):
+    async def fake(ticker: str, run_id: str | None = None):
         return FundamentalsReport(
             ticker=ticker,
             summary="# Stub memo",
@@ -132,7 +132,10 @@ def test_the_debate_entry_edge_is_conditional():
     graph = build_trading_graph(InMemorySaver()).get_graph()
     entry = [e for e in graph.edges if e.source == "sentiment"]
 
-    assert {e.target for e in entry} == {"bull_turn", "bear_turn", "debate_close"}
+    # "graceful_abort" (Phase 8) is the run-level budget/deadline guard's
+    # target, added to every conditional route map alongside the debate
+    # router's own outcomes — see application/guards.py.
+    assert {e.target for e in entry} == {"bull_turn", "bear_turn", "debate_close", "graceful_abort"}
     assert all(e.conditional for e in entry)
 
 
@@ -145,7 +148,7 @@ def test_both_debate_nodes_carry_the_full_route_map():
 
     for src in ("bull_turn", "bear_turn"):
         targets = {e.target for e in graph.edges if e.source == src}
-        assert targets == {"bull_turn", "bear_turn", "debate_close"}
+        assert targets == {"bull_turn", "bear_turn", "debate_close", "graceful_abort"}
 
 
 def test_the_risk_panel_entry_edge_is_conditional():
@@ -155,7 +158,9 @@ def test_the_risk_panel_entry_edge_is_conditional():
     graph = build_trading_graph(InMemorySaver()).get_graph()
     entry = [e for e in graph.edges if e.source == "debate_close"]
 
-    assert {e.target for e in entry} == {"neutral_turn", "aggressive_turn", "conservative_turn", "risk_close"}
+    assert {e.target for e in entry} == {
+        "neutral_turn", "aggressive_turn", "conservative_turn", "risk_close", "graceful_abort",
+    }
     assert all(e.conditional for e in entry)
 
 
@@ -164,18 +169,61 @@ def test_all_three_risk_nodes_carry_the_full_route_map():
 
     for src in ("neutral_turn", "aggressive_turn", "conservative_turn"):
         targets = {e.target for e in graph.edges if e.source == src}
-        assert targets == {"neutral_turn", "aggressive_turn", "conservative_turn", "risk_close"}
+        assert targets == {
+            "neutral_turn", "aggressive_turn", "conservative_turn", "risk_close", "graceful_abort",
+        }
 
 
 def test_the_post_risk_chain_is_still_linear():
+    """risk_close -> synthesizer is now GUARDED (Phase 8) — synthesizer is
+    an LLM-calling node, so its entry edge goes through the same
+    budget/deadline check every other LLM node's entry does. Only
+    synthesizer -> __end__ and graceful_abort -> __end__, where there is no
+    further LLM call to protect, stay plain edges."""
     graph = build_trading_graph(InMemorySaver()).get_graph()
     linear = {(e.source, e.target) for e in graph.edges if not e.conditional}
+    conditional = {(e.source, e.target) for e in graph.edges if e.conditional}
 
-    assert ("risk_close", "synthesizer") in linear
+    assert ("risk_close", "synthesizer") in conditional
+    assert ("risk_close", "graceful_abort") in conditional
     assert ("synthesizer", "__end__") in linear
+    assert ("graceful_abort", "__end__") in linear
     # and debate_close -> risk is NOT linear — it's the risk panel's
     # conditional entry edge, asserted above
     assert ("debate_close", "risk") not in linear
+
+
+def test_guard_precedes_every_llm_node():
+    """Phase 8 criterion 8's structural half: every LLM-calling node's
+    incoming edge(s) must be guarded, so a future node wired in with a
+    plain add_edge() cannot silently bypass the run-level budget/deadline
+    ledger (application/guards.py). `fundamentals` — reached only via the
+    plain START edge — is the sole exemption: at t=0 with zero spend
+    nothing can have breached yet, so guarding that edge would only add a
+    router call that can never return "abort" (see graph.py's comment on
+    why it is left plain)."""
+    graph = build_trading_graph(InMemorySaver()).get_graph()
+    llm_nodes = {
+        "technical", "news", "bull_turn", "bear_turn",
+        "neutral_turn", "aggressive_turn", "conservative_turn", "synthesizer",
+    }
+
+    for node in llm_nodes:
+        incoming = [e for e in graph.edges if e.target == node]
+        assert incoming, f"{node} has no incoming edges at all"
+        unguarded = [e.source for e in incoming if not e.conditional]
+        assert not unguarded, f"{node} has a plain (unguarded) incoming edge from {unguarded}"
+
+        # Conditional is necessary but not sufficient — confirm "abort" is
+        # actually one of the routes each such source can take, not just
+        # that SOME conditional router sits there (e.g. next_debate_step's
+        # own bull/bear/done branches, pre-Phase-8).
+        for src in {e.source for e in incoming}:
+            targets = {e.target for e in graph.edges if e.source == src}
+            assert "graceful_abort" in targets, (
+                f"{src}'s conditional edge into {node} has no abort route "
+                f"to graceful_abort"
+            )
 
 
 def test_the_old_debate_and_risk_stub_nodes_are_gone():
@@ -329,7 +377,7 @@ async def test_a_run_with_no_analyst_evidence_skips_the_debate_entirely(monkeypa
     _stub_debate(monkeypatch, productive=True)
     _stub_synthesis(monkeypatch)
 
-    async def no_report(ticker: str):
+    async def no_report(ticker: str, run_id: str | None = None):
         return None
 
     monkeypatch.setattr(nodes, "get_fundamentals_report", no_report)

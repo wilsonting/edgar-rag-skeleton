@@ -66,8 +66,8 @@ def _patch_ports(monkeypatch, raw, items, issues=None, cost=0.01):
     async def fake_fetch(ticker, as_of, lookback_days=14):
         return raw, as_of - timedelta(days=lookback_days)
 
-    async def fake_digest(articles, ticker):
-        return items, issues or [], cost
+    async def fake_digest(articles, ticker, run_id=None):
+        return items, issues or [], cost, None, []
 
     monkeypatch.setattr(nodes, "fetch_company_news", fake_fetch)
     monkeypatch.setattr(nodes, "build_digest", fake_digest)

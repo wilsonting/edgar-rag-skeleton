@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date
 from pydantic import BaseModel, Field
 
+from app.agent.trading.domain.budget import CostEvent
+
 
 class TechnicalIndicators(BaseModel):
     """Raw, Python-computed values. No LLM ever writes to this model."""
@@ -48,3 +50,4 @@ class TechnicalReport(BaseModel):
                      "back to `indicators` — populated by the guard in "
                      "technical_interpreter_port.py",
     )
+    cost_event: CostEvent | None = None

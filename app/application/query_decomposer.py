@@ -1,8 +1,10 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
-import os
+
+from app.domain.token_usage import TokenUsage
 import re
-from anthropic import AsyncAnthropic
+from app.infrastructure.llm import get_client
+from app.infrastructure.llm.models import model_for
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +90,9 @@ class DecompositionResult:
     original_query: str
     was_decomposed: bool
     sub_queries: list[str]   # if not decomposed, contains [original_query]
+    # Zero on the regex-only path, which is the common case: `needs_rewrite`
+    # returning None means no LLM call happened at all.
+    usage: TokenUsage = field(default_factory=TokenUsage)
 
 class QueryDecomposer:
     """
@@ -102,8 +107,8 @@ class QueryDecomposer:
     """
 
     def __init__(self, model: str | None = None):
-        self._client = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        self._model = model or os.getenv("LLM_CLAUDE_MODEL")
+        self._model = model or model_for("decomposer")
+        self._client = get_client(self._model)
 
     def needs_rewrite(self, query: str) -> str | None:
         """Stage 1: cheap detection.
@@ -154,12 +159,17 @@ class QueryDecomposer:
             and not line.strip().lower().startswith("original")
         ]
 
+        # The call was billed whether or not it produced usable variants, so
+        # the fallback path below carries the usage too.
+        usage = TokenUsage.from_response(resp.usage)
+
         if not sub_queries:
             logger.warning("Rewriting returned no variants; falling back to original")
             return DecompositionResult(
                 original_query=query,
                 was_decomposed=False,
                 sub_queries=[query],
+                usage=usage,
             )
 
         logger.info("Rewrote into %d sub-queries: %s", len(sub_queries), sub_queries)
@@ -167,4 +177,5 @@ class QueryDecomposer:
             original_query=query,
             was_decomposed=True,
             sub_queries=sub_queries,
+            usage=usage,
         ) 

@@ -46,7 +46,7 @@ async def test_bull_turn_returns_a_single_element_delta(monkeypatch):
 
     update = await debate_nodes.bull_turn_node({"ticker": "ACN", "debate_turns": [_turn(0), _turn(1)]})
 
-    assert list(update) == ["debate_turns"]
+    assert set(update) == {"debate_turns", "cost_events"}
     assert len(update["debate_turns"]) == 1
     assert update["debate_turns"][0].turn_index == 2
 

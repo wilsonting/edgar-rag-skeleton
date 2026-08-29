@@ -46,16 +46,17 @@ from __future__ import annotations
 import os
 import re
 import sys
+from dataclasses import dataclass, field
 
-from anthropic import AsyncAnthropic
+from app.infrastructure.llm import LLMClient, get_client
+from app.infrastructure.llm.models import model_for, warn_if_unpriced
 from pydantic import ValidationError
 
 from app.agent.researcher import (
-    AGENT_MODEL,
-    _MODEL_PRICING,
     UsageSummary,
     log_cost,
 )
+from app.agent.trading.domain.budget import CostEvent
 from app.agent.trading.domain.debate import DebateClaim, DebateTurn, canonical_claims
 from app.agent.trading.domain.decision_memo import (
     DecisionMemo,
@@ -64,6 +65,8 @@ from app.agent.trading.domain.decision_memo import (
     Verdict,
 )
 from app.agent.trading.domain.risk import RiskLedgerEntry, RiskTurn
+from app.agent.trading.domain.sanitize import EXTERNAL_TEXT_FRAMING
+from app.agent.trading.infrastructure.cost_log import new_event_id, record_cost_event
 
 # Follows the project-wide model from .env (LLM_CLAUDE_MODEL), same override
 # pattern as DEBATE_MODEL/RISK_MODEL — NOT pinned to Sonnet. The spec names
@@ -74,8 +77,8 @@ from app.agent.trading.domain.risk import RiskLedgerEntry, RiskTurn
 # switching back makes the temperature=0 replay a genuine controlled
 # condition for the Research Manager/Risk Judge too, not just the risk
 # panel. Still overridable per-role independent of the project-wide default.
-RESEARCH_MANAGER_MODEL = os.getenv("TRADING_RESEARCH_MANAGER_MODEL") or AGENT_MODEL
-RISK_JUDGE_MODEL = os.getenv("TRADING_RISK_JUDGE_MODEL") or AGENT_MODEL
+RESEARCH_MANAGER_MODEL = model_for("research_manager")
+RISK_JUDGE_MODEL = model_for("risk_judge")
 
 SYNTHESIS_MAX_TOKENS = 4000
 
@@ -87,13 +90,7 @@ SYNTHESIS_MAX_TOKENS = 4000
 SYNTHESIS_BUDGET_USD = 0.30
 
 for _model in (RESEARCH_MANAGER_MODEL, RISK_JUDGE_MODEL):
-    if _model not in _MODEL_PRICING:
-        print(
-            f"[synthesis] WARNING: no pricing configured for {_model} — its "
-            f"calls will log cost as null and the ${SYNTHESIS_BUDGET_USD:.2f} "
-            f"combined budget assertion cannot fire for them. Add it to "
-            f"_MODEL_PRICING in researcher.py."
-        )
+    warn_if_unpriced(_model, "synthesis", SYNTHESIS_BUDGET_USD)
 
 _CRASH_AT = os.getenv("SYNTHESIS_CRASH_AT")   # "research" | "risk_judge" | None
 
@@ -111,26 +108,86 @@ class SynthesisReferenceError(Exception):
     """A reference token names no real claim_id or factor_id, on the SECOND
     attempt (the model was already shown the unresolved ids once and asked
     to correct them). Raised rather than dropped — a silently-dropped
-    reference leaves a fluent sentence whose support has vanished."""
+    reference leaves a fluent sentence whose support has vanished.
+
+    `cost_events` (Phase 8, default []): whatever CostEvents were already
+    incurred before this raise. Empty when raised from inside
+    `_resolve_with_retry` — that path has never logged cost either (a
+    pre-existing gap, not one this phase introduces); populated by
+    `run_synthesis` when it re-raises a Risk Judge failure, so the Research
+    Manager's already-spent cost isn't lost with it.
+    """
+
+    def __init__(self, message: str, *, cost_events: list[CostEvent] | None = None):
+        super().__init__(message)
+        self.cost_events = cost_events or []
 
 
 class SynthesisFabricationError(Exception):
     """A number in a load-bearing field (Research Manager's `thesis`, Risk
     Judge's `risk_narrative`/`reasoning`) appears in no report, no debate
     claim, and no risk factor. Blocking, not flagging — see
-    `_numeric_guard`."""
+    `_numeric_guard`.
+
+    `cost_events`: see SynthesisReferenceError's docstring — same contract.
+    """
+
+    def __init__(self, message: str, *, cost_events: list[CostEvent] | None = None):
+        super().__init__(message)
+        self.cost_events = cost_events or []
+
+
+class MemoVerificationError(Exception):
+    """The FULLY ASSEMBLED memo failed `verify_decision_memo` even though
+    every individual call that produced it passed its own guard at
+    generation time. More serious than a plain SynthesisFabricationError/
+    SynthesisReferenceError: those catch a bad call before its output is
+    used; this catches a bad artifact built from calls that each looked
+    clean in isolation — an assembly-step bug (e.g. a future DecisionMemo
+    field wired in without going through the guard), not a model output
+    the pipeline already knows how to reject."""
 
 
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
 
-RESEARCH_MANAGER_SYSTEM = """\
+# Rule 1 in both prompts below already forbids writing ANY number in the
+# narrative fields, and both models violate it routinely: NFLX's memo opens
+# "free cash flow accelerated 37%, leverage fell 41 basis points gross and
+# 34 basis points net, and operating margin expanded 280 bps" — five
+# numbers in the first sentence of a field where none are allowed. The
+# guard that runs after does not catch this, because it checks whether a
+# number is BACKED, not whether it should be there at all.
+#
+# So this is written as a fallback rule rather than a repetition of rule 1:
+# given that figures do get restated, the units have to survive the
+# restatement. Ported from the research agent's own prompt
+# (app/agent/prompts.py), where the identical rule demonstrably works —
+# NFLX's fundamentals report says "a 0.41-turn improvement" and it is the
+# SYNTHESIS layer, which had no such rule, that turned it into "41 basis
+# points". A 27% reduction in gross leverage reported as 0.41 percentage
+# points is the memo's lead positive claim, wrong by two orders of
+# magnitude, and every guard in the pipeline passed it.
+_UNITS_RULE = """\
+UNITS SURVIVE RESTATEMENT. Rule 1 says not to restate figures at all. If
+   you do anyway, the unit must be right: basis points and percentage
+   points apply ONLY to metrics already expressed as a percentage —
+   margins, rates, yields. A leverage, coverage or any ratio expressed in
+   "x" (turns) changes in TURNS: 1.50x to 1.09x is a 0.41-turn improvement,
+   never "41 basis points". Never attach a currency sign to a ratio
+   ("2.80x", not "$2.80x"). Gross and net are different figures — if the
+   source distinguishes them, say which one you mean."""
+
+
+RESEARCH_MANAGER_SYSTEM = f"""\
 You are the Research Manager for an equity research pipeline. You will be
 given the analyst reports and the bull/bear debate transcript for one
 ticker. Your job is to synthesize the DEBATE — you do not see any risk
 assessment; that happens after you, in a separate review you have no
 visibility into.
+
+{EXTERNAL_TEXT_FRAMING}
 
 HARD RULES — checked in code after you answer:
 
@@ -145,15 +202,18 @@ HARD RULES — checked in code after you answer:
    risk panel you never see, decides buy/sell/hold. Do not hedge your
    `thesis` toward a particular direction in anticipation of that decision
    — describe what the debate actually supports.
+4. {_UNITS_RULE}
 
 Call `submit_research_synthesis` exactly once. Say nothing else."""
 
-RISK_JUDGE_SYSTEM = """\
+RISK_JUDGE_SYSTEM = f"""\
 You are the Risk Judge for an equity research pipeline — the sole decision
 maker. You will be given the analyst reports, the bull/bear debate, the
 three-persona risk panel's ledger, AND the Research Manager's own synthesis
 of the debate (their bull_case, bear_case, and thesis — they do not issue a
 verdict; that is your job alone, informed by risk factors they never saw).
+
+{EXTERNAL_TEXT_FRAMING}
 
 HARD RULES — checked in code after you answer:
 
@@ -172,6 +232,7 @@ HARD RULES — checked in code after you answer:
    PIPELINE'S ONLY verdict.
 4. `watch_items`: at most 5, each an observable (not a vague sentiment) that
    would change this read, each citing the `[RFnn]` factor it comes from.
+5. {_UNITS_RULE}
 
 A risk ledger with no rows, or a report/debate marked "NOT RUN"/"empty", is
 missing evidence, not neutral evidence — do not infer anything from its
@@ -204,7 +265,7 @@ def build_research_pack(state) -> str:
 def _render_ledger(ledger: list[RiskLedgerEntry]) -> str:
     if not ledger:
         return "RISK LEDGER: none — no risk panel ran."
-    lines = ["RISK LEDGER (cite factor ids exactly as shown, e.g. [RF00]):"]
+    lines = ["RISK LEDGER (cite factor ids exactly as shown, e.g. [RF1A2B]):"]
     for e in ledger:
         scores = ", ".join(
             f"{p}=severity{sev}/likelihood{lik}" for p, (sev, lik) in e.scores.items()
@@ -255,7 +316,25 @@ def build_risk_judge_pack(
 # shapes and this logic is otherwise identical for both.
 # ---------------------------------------------------------------------------
 
-_REF_PATTERN = re.compile(r"\[C:([\w.-]+)\]|\[(RF\d+)\]")
+# `RF\d+` was written when `factor_id` was `f"RF{i:02d}"`. `_content_id`
+# (risk_port.py) replaced that with a 4-char SHA-1 prefix in hex, uppercase,
+# with an optional numeric collision suffix — so a real id is `RF487E` far
+# more often than `RF3755`, and only the ~15% of ids that happen to be
+# all-digits ever matched. Found live (2026-08-26, Phase 9 Gate work) on a
+# real NFLX memo: five factors cited, four of them hex, and the rendered
+# Evidence section listed exactly one — the all-digit `RF3755`. The other
+# four were invisible to BOTH `_render_evidence` (so the reader gets a
+# citation with nothing behind it) and `resolve_refs` (so a hallucinated
+# factor id containing any of A-F passed post-hoc verification silently).
+#
+# Deliberately `RF[0-9A-Za-z]+` rather than a pattern that re-encodes the
+# current id shape: matching is only about FINDING citation-shaped tokens,
+# and `resolve_refs`/`_render_evidence` both decide validity by membership
+# in the real slate anyway. A looser matcher hands an unknown id to that
+# membership check — which reports it — where a tighter one drops it on the
+# floor. This bug was the tight version failing exactly that way, and the
+# whole test suite missed it because every fixture still used `RF00`.
+_REF_PATTERN = re.compile(r"\[C:([\w.-]+)\]|\[(RF[0-9A-Za-z]+)\]")
 
 
 def extract_refs(*texts: str) -> list[str]:
@@ -334,16 +413,43 @@ def compute_confidence(
 # Numeric guard
 # ---------------------------------------------------------------------------
 
-def _numeric_corpus(state, ledger: list[RiskLedgerEntry], debate_turns: list[DebateTurn]) -> str:
+def _grounded_corpus(state) -> str:
+    """The analyst reports, and NOTHING the debate or the risk panel wrote.
+
+    This is the only text in a run that traces to something outside the
+    models' own reasoning: fundamentals from EDGAR retrieval, technical from
+    computed indicators, news from the Finnhub feed. A figure that appears
+    here has a source. A figure that appears only downstream of here was
+    produced by a model, whatever else is true of it.
+    """
     from app.agent.trading.infrastructure.debate_port import report_texts
 
+    return "\n".join(report_texts(state).values())
+
+
+def _derived_corpus(state, ledger: list[RiskLedgerEntry], debate_turns: list[DebateTurn]) -> str:
+    """Everything the debate and the risk panel produced.
+
+    Kept SEPARATE from `_grounded_corpus` rather than concatenated with it,
+    because merging the two is what let a fabricated figure certify itself —
+    see `verify_decision_memo`.
+    """
     claims = canonical_claims(debate_turns)
-    parts = list(report_texts(state).values())
-    parts += [f"{c.text} {c.evidence_quote}" for c in claims.values()]
+    parts = [f"{c.text} {c.evidence_quote}" for c in claims.values()]
     parts += [f"{e.text} {e.trigger} {e.evidence_quote}" for e in ledger]
     risk_turns: list[RiskTurn] = state.get("risk_turns") or []
     parts += [s.rationale for t in risk_turns for s in t.payload.scores]
     return "\n".join(parts)
+
+
+def _numeric_corpus(state, ledger: list[RiskLedgerEntry], debate_turns: list[DebateTurn]) -> str:
+    """Grounded + derived, the corpus each GENERATION-time guard checks
+    against. Generation-time is the right place for the union: a debater
+    citing the previous turn's figure is doing its job, and so is a risk
+    persona scoring a factor another persona proposed. The union is only
+    wrong for the post-hoc memo check, which is the one place a number has
+    finished travelling and its ORIGIN is the question."""
+    return _grounded_corpus(state) + "\n" + _derived_corpus(state, ledger, debate_turns)
 
 
 def _numeric_guard(block_text: str, other_text: str, corpus: str) -> tuple[list[str], list[str]]:
@@ -355,6 +461,104 @@ def _numeric_guard(block_text: str, other_text: str, corpus: str) -> tuple[list[
     return (
         _flag_debate_numbers(block_text, corpus),
         _flag_debate_numbers(other_text, corpus),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Post-hoc memo verification — Phase 7. `_numeric_guard` above checks each
+# call's own payload fields DURING generation; nothing previously re-checked
+# the FULLY ASSEMBLED memo synthesizer_node actually returns (majority-of-N
+# voting picks one sample's narrative and Python appends data_gaps/
+# verdict_samples on top of it — nothing re-verified that result). This is
+# the same containment methodology as `_numeric_guard`, not a second
+# implementation, run once more over the assembled whole rather than one
+# call's fragment — deliberately not app/application/citation_verifier's
+# tolerance-band matching (see debate_port.py's module docstring for why
+# that goes blind on a corpus this dense: bands overlap and a fabricated
+# figure lands inside somebody's band).
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MemoVerification:
+    passed: bool
+    unbacked_numbers: list[str] = field(default_factory=list)
+    unresolved_references: list[str] = field(default_factory=list)
+    # Figures with NO source: absent from the analyst reports, present only
+    # in text the debate or the risk panel wrote. Reported separately from
+    # `unbacked_numbers` (absent from everywhere) because the two need
+    # different reading. An unbacked number is a memo-assembly bug. A
+    # debate-originated one is a number the pipeline produced and then
+    # treated as evidence — which may be a sound derivation from grounded
+    # endpoints, or may be an invention. Only a human can tell those apart,
+    # so this reports rather than blocks. See `verify_decision_memo`.
+    debate_originated_numbers: list[str] = field(default_factory=list)
+
+
+def verify_decision_memo(
+    memo: DecisionMemo,
+    state,
+    ledger: list[RiskLedgerEntry],
+    debate_turns: list[DebateTurn],
+) -> MemoVerification:
+    """`state`/`ledger`/`debate_turns` must be the SAME trial the memo was
+    generated from — under majority-of-N sampling each trial ran its own
+    independent risk panel with its own factor ids, so verifying against a
+    different trial's ledger would misreport a real citation as unresolved.
+
+    `data_gaps`/`assumptions`/`evidence` are excluded from the scanned text
+    on purpose: `data_gaps` entries quote already-flagged unbacked numbers
+    BY DESIGN (that's why they're gaps, not claims), and `evidence` is
+    Python-rendered from resolved references, not model prose — scanning
+    either would just re-report what the pipeline already knows.
+
+    The NUMERIC scan is deliberately narrower than the REFERENCE scan, for
+    the same reason: `run_research_manager`/`run_risk_judge` already split
+    their own fields into blocking (`thesis`; `risk_narrative`+`reasoning`)
+    and gap-only (`bull_case`/`bear_case`; `watch_items`) — an unbacked
+    number in the gap-only fields was ALREADY let through on purpose and
+    recorded honestly in `data_gaps`. Live-caught (ASML, 2026-08-26): the
+    first version of this function scanned `watch_items` for numbers too,
+    uniformly with the blocking fields, and raised `MemoVerificationError`
+    on a `watch_items` figure the pipeline had already, correctly, decided
+    was a non-fatal gap — re-deriving a STRICTER standard than generation
+    time itself uses is exactly the kind of assembly-step inconsistency
+    this function exists to catch, and this was an instance of it, not a
+    fabrication. Reference resolution has no such split — `resolve_refs`
+    runs over every field at generation time regardless of block/gap
+    status, so the post-hoc check mirrors that uniformly instead."""
+    grounded = _grounded_corpus(state)
+    derived = _derived_corpus(state, ledger, debate_turns)
+    load_bearing = "\n".join([memo.research_thesis, memo.risk_debate_summary, memo.reasoning])
+    all_narrative = "\n".join([
+        memo.bull_case, memo.bear_case, memo.research_thesis,
+        memo.risk_debate_summary, memo.reasoning, *memo.watch_items,
+    ])
+
+    # Two passes over the SAME text against DIFFERENT corpora, and the
+    # difference between them is the finding.
+    #
+    # Against grounded+derived: what the old single-corpus check reported —
+    # figures with no antecedent anywhere in the run.
+    # Against grounded alone: figures with no antecedent in any ANALYST
+    # REPORT. Subtract the first from the second and what remains is the
+    # set of numbers the pipeline invented somewhere between the analysts
+    # and the memo.
+    numeric_flags, _ = _numeric_guard(load_bearing, "", grounded + "\n" + derived)
+    ungrounded, _ = _numeric_guard(load_bearing, "", grounded)
+    originated = [n for n in ungrounded if n not in set(numeric_flags)]
+
+    claims = canonical_claims(debate_turns)
+    ledger_by_id = {e.factor_id: e for e in ledger}
+    unresolved = resolve_refs([all_narrative], claims, ledger_by_id)
+
+    return MemoVerification(
+        # `originated` deliberately does NOT gate — see the field comment on
+        # MemoVerification and the docstring above. Blocking on it would fail
+        # every memo that states a growth rate.
+        passed=not numeric_flags and not unresolved,
+        unbacked_numbers=numeric_flags,
+        unresolved_references=unresolved,
+        debate_originated_numbers=originated,
     )
 
 
@@ -394,7 +598,7 @@ def _risk_judge_tool() -> dict:
 
 
 async def _call_model(
-    client: AsyncAnthropic, model: str, tool: dict, system_blocks: list[dict],
+    client: LLMClient, model: str, tool: dict, system_blocks: list[dict],
     messages: list[dict], temperature: float | None,
 ):
     from app.agent.trading.infrastructure.debate_port import (
@@ -455,7 +659,7 @@ def _accumulate(usage: UsageSummary, raw) -> None:
 
 
 async def _call_with_schema_retry(
-    client: AsyncAnthropic, model: str, tool: dict, payload_cls,
+    client: LLMClient, model: str, tool: dict, payload_cls,
     system_blocks: list[dict], messages: list[dict], usage: UsageSummary,
     temperature: float | None,
 ):
@@ -528,12 +732,13 @@ async def run_research_manager(
     state,
     *,
     claims: dict[str, DebateClaim],
-    client: AsyncAnthropic | None = None,
+    client: LLMClient | None = None,
     temperature: float | None = None,
-) -> tuple[ResearchManagerPayload, float | None, list[str]]:
+) -> tuple[ResearchManagerPayload, float | None, list[str], CostEvent]:
     """Synthesizes the bull/bear debate ONLY. Returns (payload, cost,
-    gap_flags) — `gap_flags` are unbacked numbers OUTSIDE `thesis` (bull_case/
-    bear_case), non-fatal, for the caller to fold into the memo's data_gaps.
+    gap_flags, cost_event) — `gap_flags` are unbacked numbers OUTSIDE
+    `thesis` (bull_case/bear_case), non-fatal, for the caller to fold into
+    the memo's data_gaps.
 
     `temperature`: None in production (adaptive thinking stays on). Set
     explicitly only by the determinism/stability check scripts — see
@@ -542,7 +747,7 @@ async def run_research_manager(
     """
     _maybe_crash("research")
     ticker = state["ticker"]
-    client = client or AsyncAnthropic()
+    client = client or get_client(RESEARCH_MANAGER_MODEL)
 
     pack = build_research_pack(state)
     system_blocks = [
@@ -559,6 +764,18 @@ async def run_research_manager(
         claims=claims, ledger_by_id={}, label="research_manager",
     )
 
+    # log_cost runs BEFORE the fabrication guard below, not after: usage is
+    # already final at this point (no more API calls happen past this line),
+    # and a call that trips the guard still spent real tokens. Logging after
+    # the guard's raise meant a blocked call's spend never reached
+    # cost-log.jsonl — see trading-agent-known-gaps.md (FIG, 2026-08-26).
+    event_id = new_event_id("research_manager")
+    cost = log_cost(
+        ticker, "trading-research-manager", usage,
+        model=RESEARCH_MANAGER_MODEL, run_id=state.get("run_id"), event_id=event_id,
+    )
+    cost_event = record_cost_event(event_id, "research_manager", usage, RESEARCH_MANAGER_MODEL, cost)
+
     debate_turns: list[DebateTurn] = state.get("debate_turns") or []
     corpus = _numeric_corpus(state, [], debate_turns)
     block_flags, gap_flags = _numeric_guard(
@@ -567,7 +784,8 @@ async def run_research_manager(
     if block_flags:
         raise SynthesisFabricationError(
             f"Research Manager synthesis for {ticker} has unbacked number(s) in "
-            f"`thesis`: {block_flags} — not present in any report or debate claim"
+            f"`thesis`: {block_flags} — not present in any report or debate claim",
+            cost_events=[cost_event],
         )
     if gap_flags:
         # Surfaced by the caller (run_synthesis) into the memo's data_gaps —
@@ -575,8 +793,7 @@ async def run_research_manager(
         # append to.
         print(f"[synthesis] research_manager: unbacked number(s) outside thesis: {gap_flags}")
 
-    cost = log_cost(ticker, "trading-research-manager", usage, model=RESEARCH_MANAGER_MODEL)
-    return payload, cost, gap_flags
+    return payload, cost, gap_flags, cost_event
 
 
 # ---------------------------------------------------------------------------
@@ -589,18 +806,18 @@ async def run_risk_judge(
     ledger: list[RiskLedgerEntry],
     claims: dict[str, DebateClaim],
     research: ResearchManagerPayload,
-    client: AsyncAnthropic | None = None,
+    client: LLMClient | None = None,
     temperature: float | None = None,
-) -> tuple[RiskJudgePayload, float | None, list[str]]:
+) -> tuple[RiskJudgePayload, float | None, list[str], CostEvent]:
     """Synthesizes the risk ledger, reviews the Research Manager's output,
-    and issues the FINAL verdict. Returns (payload, cost, gap_flags).
+    and issues the FINAL verdict. Returns (payload, cost, gap_flags, cost_event).
 
     `temperature`: same contract as run_research_manager — None in
     production, explicit only for the determinism/stability checks.
     """
     _maybe_crash("risk_judge")
     ticker = state["ticker"]
-    client = client or AsyncAnthropic()
+    client = client or get_client(RISK_JUDGE_MODEL)
     ledger_by_id = {e.factor_id: e for e in ledger}
 
     pack = build_risk_judge_pack(state, ledger, research)
@@ -618,6 +835,16 @@ async def run_risk_judge(
         claims=claims, ledger_by_id=ledger_by_id, label="risk_judge",
     )
 
+    # See the identical comment in run_research_manager: log the cost before
+    # the fabrication guard can raise, since usage is already final and a
+    # blocked call still spent real tokens.
+    event_id = new_event_id("risk_judge")
+    cost = log_cost(
+        ticker, "trading-risk-judge", usage,
+        model=RISK_JUDGE_MODEL, run_id=state.get("run_id"), event_id=event_id,
+    )
+    cost_event = record_cost_event(event_id, "risk_judge", usage, RISK_JUDGE_MODEL, cost)
+
     debate_turns: list[DebateTurn] = state.get("debate_turns") or []
     corpus = _numeric_corpus(state, ledger, debate_turns)
     block_flags, gap_flags = _numeric_guard(
@@ -629,11 +856,11 @@ async def run_risk_judge(
         raise SynthesisFabricationError(
             f"Risk Judge synthesis for {ticker} has unbacked number(s) in "
             f"risk_narrative/reasoning: {block_flags} — not present in any report, "
-            f"debate claim, or risk factor"
+            f"debate claim, or risk factor",
+            cost_events=[cost_event],
         )
 
-    cost = log_cost(ticker, "trading-risk-judge", usage, model=RISK_JUDGE_MODEL)
-    return payload, cost, gap_flags
+    return payload, cost, gap_flags, cost_event
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +874,7 @@ async def run_synthesis(
     base_gaps: list[str],
     base_evidence: list[str],
     as_of,
-    client: AsyncAnthropic | None = None,
+    client: LLMClient | None = None,
     research_temperature: float | None = None,
     risk_temperature: float | None = None,
 ) -> DecisionMemo:
@@ -664,13 +891,21 @@ async def run_synthesis(
     debate_turns: list[DebateTurn] = state.get("debate_turns") or []
     claims = canonical_claims(debate_turns)
 
-    research, research_cost, research_gaps = await run_research_manager(
+    research, research_cost, research_gaps, research_cost_event = await run_research_manager(
         state, claims=claims, client=client, temperature=research_temperature
     )
-    risk_judgment, risk_cost, risk_gaps = await run_risk_judge(
-        state, ledger=ledger, claims=claims, research=research,
-        client=client, temperature=risk_temperature,
-    )
+    try:
+        risk_judgment, risk_cost, risk_gaps, risk_cost_event = await run_risk_judge(
+            state, ledger=ledger, claims=claims, research=research,
+            client=client, temperature=risk_temperature,
+        )
+    except (SynthesisFabricationError, SynthesisReferenceError) as exc:
+        # The Research Manager's call already succeeded and its cost is
+        # already known here — merge it in before re-raising, or it is lost
+        # the moment this exception unwinds past this function. See both
+        # exception classes' docstrings.
+        exc.cost_events = [research_cost_event, *exc.cost_events]
+        raise
 
     total_cost = (research_cost or 0.0) + (risk_cost or 0.0)
     _assert_within_budget(ticker, total_cost)
@@ -726,4 +961,5 @@ async def run_synthesis(
         data_gaps=data_gaps,
         assumptions=[],
         evidence=evidence,
+        cost_events=[research_cost_event, risk_cost_event],
     )

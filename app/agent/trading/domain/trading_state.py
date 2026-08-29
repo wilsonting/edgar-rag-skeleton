@@ -1,6 +1,7 @@
 import operator
 from datetime import date
 from typing import Annotated, TypedDict
+from app.agent.trading.domain.budget import CostEvent, RunBudget, RunTermination
 from app.agent.trading.domain.debate import DebateTurn
 from app.agent.trading.domain.decision_memo import DecisionMemo
 from app.agent.trading.domain.fundamentals_report import FundamentalsReport
@@ -15,6 +16,25 @@ class TradingState(TypedDict, total=False):
     # graph entry (CLI --as-of), never computed inside a node: a node calling
     # date.today() internally makes probe-date runs impossible to verify.
     as_of_date: date
+
+    # Identifies this run's cost-log lines. Set once at the CLI boundary
+    # (same rule as as_of_date) so every cost_event and the run_summary line
+    # it rolls up into can be grouped with one `jq` filter.
+    run_id: str
+    # Set once at the CLI boundary, never mutated, never computed inside a
+    # node — same reasoning as as_of_date. See domain/budget.py.
+    budget: RunBudget
+    # One entry per LLM call, across every node in the pipeline. An
+    # add-reducer for the same reason debate_turns/risk_turns are: several
+    # nodes append to this channel across the run, and only the delta —
+    # never the accumulated list — is ever returned from a node.
+    cost_events: Annotated[list[CostEvent], operator.add]
+    # None while the run is in progress or finished normally. Set only by
+    # graceful_abort_node when domain/guards.py's check_run_guards trips —
+    # a budget or deadline breach, never a debate/risk-quality outcome (that
+    # distinction is exactly what keeps this independent of
+    # debate_terminated_by/risk_terminated_by below).
+    run_terminated_by: RunTermination | None
     fundamentals_report: FundamentalsReport
     technical_report: TechnicalReport
     news_digest: NewsDigest

@@ -37,7 +37,7 @@ async def test_neutral_turn_returns_a_single_element_delta(monkeypatch):
         {"ticker": "ACN", "risk_turns": [_turn(0), _turn(1), _turn(2)]}
     )
 
-    assert list(update) == ["risk_turns"]
+    assert set(update) == {"risk_turns", "cost_events"}
     assert len(update["risk_turns"]) == 1
     assert update["risk_turns"][0].turn_index == 3
 

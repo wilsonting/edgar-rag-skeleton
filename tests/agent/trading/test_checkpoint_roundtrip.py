@@ -470,7 +470,7 @@ def _stub_expensive_nodes(monkeypatch, tmp_path) -> None:
     df = pd.read_csv(FIXTURE, index_col=0)
     df.index = pd.to_datetime(df.index, utc=True)
 
-    async def fake_fundamentals(ticker: str):
+    async def fake_fundamentals(ticker: str, run_id: str | None = None):
         return FundamentalsReport(
             ticker=ticker,
             summary="# Stub memo",
@@ -484,8 +484,8 @@ def _stub_expensive_nodes(monkeypatch, tmp_path) -> None:
     async def fake_price_history(ticker: str, as_of: date):
         return df, "fixture", 0
 
-    async def fake_interpret(ticker: str, indicators):
-        return "Stub interpretation, no numbers.", [], [], None
+    async def fake_interpret(ticker: str, indicators, run_id: str | None = None):
+        return "Stub interpretation, no numbers.", [], [], None, None
 
     # The news ports are stubbed at the same seam the real node calls, so
     # news_node's own body — the as_of guard, filter_and_dedup, the digest
@@ -523,7 +523,7 @@ def _stub_expensive_nodes(monkeypatch, tmp_path) -> None:
         ]
         return raw, as_of - timedelta(days=lookback_days)
 
-    async def fake_build_digest(articles, ticker):
+    async def fake_build_digest(articles, ticker, run_id: str | None = None):
         items = [
             NewsItem(
                 headline=a["headline"],
@@ -536,7 +536,7 @@ def _stub_expensive_nodes(monkeypatch, tmp_path) -> None:
             )
             for i, a in enumerate(articles)
         ]
-        return items, [], None
+        return items, [], None, None, []
 
     monkeypatch.setattr(nodes, "get_fundamentals_report", fake_fundamentals)
     monkeypatch.setattr(nodes, "get_price_history", fake_price_history)

@@ -441,11 +441,107 @@ server-side cost is of the same order as the agent loop. Closing this
 requires returning `usage` through `AskResponse` and `FinancialMetrics` and
 accumulating it in the same tracker. Embedding costs are not tracked at all.
  
-**Model configuration spans three call sites** — the agent loop
-(`researcher.AGENT_MODEL`), answer generation (`llm.answer_question`
-default), and metric extraction (`extraction_service`). These have
-disagreed in practice, which makes both cost attribution and quality
-attribution unreliable until they are set deliberately.
+**Model configuration used to span three call sites** — the agent loop,
+answer generation, and metric extraction — which had disagreed in practice
+and made both cost and quality attribution unreliable. It is now one table
+(`llm/models.py`, below); `uv run python -m app.infrastructure.llm.models`
+prints what a run will actually use.
+
+## Provider abstraction (`app/infrastructure/llm/`)
+
+Every LLM client in the app is built by `get_client(model)`. Which provider
+serves a call is decided by the model id's prefix — `claude-*` to Anthropic,
+`deepseek*` to DeepSeek, `gpt-*`/`o1`/`o3`/`o4` to OpenAI — so a run can mix
+providers per role without a global switch. `LLM_PROVIDER` overrides that
+inference wholesale for a gateway whose model ids carry no useful prefix.
+
+### Role configuration
+
+Ten LLM roles, each with its own `.env` variable, all falling back to
+`LLM_CLAUDE_MODEL`:
+
+| Role | Variable |
+| --- | --- |
+| research agent loop, and the fundamentals node that runs it | `LLM_CLAUDE_MODEL` |
+| answer generation behind `POST /ask` | `LLM_ANSWER_MODEL` |
+| query decomposition | `LLM_DECOMPOSER_MODEL` |
+| financial-metric extraction | `LLM_EXTRACTION_MODEL` |
+| news digest | `TRADING_NEWS_DIGEST_MODEL` |
+| technical-indicator interpretation | `TRADING_TECHNICAL_MODEL` |
+| bull/bear debate turns | `TRADING_DEBATE_MODEL` |
+| risk panel personas | `TRADING_RISK_MODEL` |
+| research manager synthesis | `TRADING_RESEARCH_MANAGER_MODEL` |
+| risk judge, final verdict | `TRADING_RISK_JUDGE_MODEL` |
+
+`LLM_CLAUDE_MODEL` is the only required one, so a project that sets nothing
+else behaves exactly as it did when that was the only knob. Five of these
+roles previously had no variable at all and were pinned to it; two more
+(`RISK_MODEL`, `RISK_JUDGE_MODEL`) sat in `.env` and were read by nothing,
+so changing them looked like it worked. `scripts/run_p9_battery.py` records
+`model_env_vars()` with each run rather than a hand-maintained copy — the
+copy had drifted, and a run recorded against the wrong list is one whose
+configuration cannot be reconstructed.
+
+**Anthropic's message shape is the internal lingua franca.** The ports build
+`tool_use`/`tool_result` turns by hand, the synthesis and debate schema
+retries re-send `response.content` verbatim, and the provenance guards read
+block text — that shape is load-bearing in tested code, so it stayed, and
+translation happens at the wire instead. `OpenAICompatClient` duck-types
+`AsyncAnthropic` for the surface this repo uses (`messages.create` returning
+`.content` / `.stop_reason` / `.usage`) and maps it onto an OpenAI-dialect
+chat-completions endpoint.
+
+What does not survive that translation, dropped with a once-per-process
+warning: `cache_control` breakpoints (DeepSeek caches automatically and has
+no equivalent to place), `betas`, `top_k` and `metadata`. `strict: true` on
+a tool schema DOES carry over — the dialect supports it, and it matters:
+`strict` was added to `SUBMIT_TOOL` because 3 of 3 live debate turns came
+back with a flattened payload without it.
+
+**Thinking is on by default on DeepSeek, and it rejects a constrained
+`tool_choice`.** Both `required` and a named function come back
+`400 "Thinking mode does not support this tool_choice"`; only `auto`
+survives. Since the debate, risk and synthesis ports all force a named tool
+— their contract is "call exactly this tool, exactly once", and `_extract`
+raises when no tool block arrives — the shim sends
+`thinking: {"type": "disabled"}` on any call that constrains the choice, and
+translates Anthropic's `thinking`/`output_config` to the provider's
+`thinking` object otherwise. Forcing the tool wins over keeping thinking:
+`auto` would trade a hard API guarantee for a behavioural hope on exactly
+the calls whose output is most load-bearing. Reasoning tokens bill as
+output either way, so no cost accounting depends on the choice. The
+parameter goes out in `extra_body` — the OpenAI SDK raises `TypeError` on
+top-level kwargs it does not recognise.
+
+`max_tokens` is clamped to the provider's ceiling, which surfaces as
+`stop_reason=max_tokens` on genuinely long output rather than as a 400. Both
+V4 models top out at 384K against the research agent's 16000, so it does not
+fire today — it is carried because the retired `deepseek-chat` capped at
+8192, where an unclamped request would have failed on the final turn of a
+run already paid for.
+
+Cost config moved to `llm/pricing.py` and is re-exported from `researcher.py`
+as `_MODEL_PRICING`. `LLM_PRICING_OVERRIDES` (JSON, env) merges over it, so
+a repriced model is a config change rather than a code change — and a
+malformed override raises at import rather than leaving a stale rate in
+place, because an unpriced or mispriced model makes the per-run budget
+assertion silently unable to fire.
+
+For DeepSeek, `input_tokens` is the *cache-miss* count, not `prompt_tokens`:
+their `prompt_tokens` is hits plus misses, and pricing it as input while also
+counting hits as `cache_read` would overstate every cached run.
+
+**DeepSeek prices by time of day and the table does not.** Off-peak rates are
+half of peak, and off-peak is every hour outside 01:00-04:00 and 06:00-10:00
+UTC Monday-Friday — so most runs cost about half what `pricing.py` says. The
+table holds the peak rate deliberately, the same call made for Sonnet 5's
+introductory pricing: over-estimating fails safe, whereas tracking whichever
+rate applies right now turns "did this run exceed its cap" into a question
+about what time it started.
+
+
+---
+
 
 
 ---

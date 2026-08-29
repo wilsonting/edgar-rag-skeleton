@@ -191,6 +191,16 @@ def test_raw_json_block_preserves_the_unedited_memo():
     assert json.loads(block)["bull_case"] == "STUB"
 
 
+def test_confidence_is_shown_as_a_band_alongside_the_raw_float():
+    low = _format_memo_markdown(_memo(confidence=0.1))
+    medium = _format_memo_markdown(_memo(confidence=0.5))
+    high = _format_memo_markdown(_memo(confidence=0.9))
+
+    assert "LOW (0.10)" in low
+    assert "MEDIUM (0.50)" in medium
+    assert "HIGH (0.90)" in high
+
+
 def test_gaps_are_rendered_and_counted():
     md = _format_memo_markdown(_memo(data_gaps=["a", "b"]))
     assert "## Data gaps (2)" in md
