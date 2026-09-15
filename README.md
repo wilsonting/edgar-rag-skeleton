@@ -96,11 +96,13 @@ uv run alembic upgrade head
 `.env.example` lists every variable with a comment; `.env` itself is gitignored.
 
 > **`.env` is required, and three of its variables are read at import time.**
-> `LLM_CLAUDE_MODEL` (via `model_for`), `LOOP_MAX_TURNS` and `MEMO_DIR` are read with
-> `os.environ[...]` in `app/agent/researcher.py` and `app/infrastructure/llm/models.py`,
-> both reached by `fundamentals_port` → `nodes` → `graph`. A missing value fails the
-> **entire trading CLI** with a bare `KeyError` before argument parsing. If you get
-> `KeyError: 'LLM_CLAUDE_MODEL'`, that is what happened.
+> `LLM_CLAUDE_MODEL` (via `model_for`), `LOOP_MAX_TURNS` and `MEMO_DIR`. A missing one
+> stops the process before argument parsing with `MissingSetting: <NAME> is not set…`.
+>
+> **Precedence:** a variable already set in the environment wins over `.env`, which only
+> fills in what is unset. Entry points (the API server, both CLIs, the researcher script)
+> load `.env` before anything else; see `app/config.py`. The `scripts/` battery tools
+> still load it with `override=True`, so inside them `.env` wins.
 
 ## Configuration
 
@@ -320,9 +322,10 @@ tests/
 
 Named, not hidden. The significant ones:
 
-- **`as_of_date` does not reach the fundamentals leg.** News and prices are bounded at the
-  analysis date; the fundamentals agent reads the wall clock. A historical run's memo looks
-  complete and its fundamentals research is unbounded. This is the one lookahead hole left.
+- **A historical run bounds retrieval, not the model's priors.** `as_of_date` now reaches
+  every leg: filing retrieval is capped at the analysis date (`filed_before` on every
+  `ask_edgar`, `check_latest_filings` and `extract_metrics` call), and the memo says so.
+  What no bound can reach is what the model already knows about how the period turned out.
 - **The budget is checked on edges, not inside nodes.** The synthesizer is one node making
   at least 24 model calls, so the documented "overshoot by at most one call" bound is wrong
   for the most expensive node in the pipeline.

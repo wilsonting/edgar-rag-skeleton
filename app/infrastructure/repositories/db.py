@@ -1,4 +1,3 @@
-import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -7,10 +6,12 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from pgvector.psycopg import register_vector_async
 
+from app.config import require_env
+
 _pool: AsyncConnectionPool | None = None
 
 def _connection_string() -> str:
-    url = os.environ["POSTGRES_DATABASE_URL"]
+    url = require_env("POSTGRES_DATABASE_URL")
     # Normalize: psycopg accepts postgresql:// directly
     if url.startswith("postgresql+asyncpg://"):
         url = url.replace("postgresql+asyncpg://", "postgresql://", 1)

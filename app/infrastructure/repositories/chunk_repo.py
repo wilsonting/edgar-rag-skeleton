@@ -74,6 +74,52 @@ class ChunkRepository:
 
         return results
 
+    async def delete_for_sections(self, section_ids: list[int]) -> int:
+        """Delete every chunk of these sections. Returns how many went.
+
+        What makes re-chunking idempotent: IngestionService._chunk clears a
+        document's chunks before inserting, so a run that died after the
+        insert but before the filing was marked CHUNKED re-chunks cleanly
+        instead of adding a second copy of every chunk.
+        """
+        if not section_ids:
+            return 0
+        async with get_connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM chunks WHERE section_id = ANY(%s)", (section_ids,)
+                )
+                deleted = cur.rowcount
+                await conn.commit()
+        return deleted
+
+    async def sections_with_content(
+        self, sections: list[str], tickers: list[str] | None = None
+    ) -> set[str]:
+        """Which of `sections` appear in some chunk's section path.
+
+        A section filter naming something the corpus doesn't have would
+        silently return nothing — and to the caller an empty answer is
+        indistinguishable from "the filing doesn't say". Cheap enough to
+        check before spending the retrieval: one index scan, no embedding.
+        """
+        if not sections:
+            return set()
+        # Named, because the pool's row factory is dict_row.
+        sql = (
+            "SELECT DISTINCT unnest(section_path) AS part "
+            "FROM chunks WHERE section_path && %s"
+        )
+        params: list = [sections]
+        if tickers:
+            sql += " AND ticker = ANY(%s)"
+            params.append([t.upper() for t in tickers])   # as search_by_embedding does
+        async with get_connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(sql, params)
+                found = {row["part"] for row in await cur.fetchall()}
+        return {s for s in sections if s in found}
+
     async def list_without_embeddings(
         self,
         filing_id: int | None = None,

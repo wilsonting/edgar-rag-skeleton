@@ -193,22 +193,42 @@ async def start_or_resume(
         if stale:
             return RunOutcome("refused", thread_id, refusal=stale)
         result = await graph.ainvoke(None, config=config)
+        # A resume only happens after an attempt that died mid-run — one that
+        # finished or aborted gracefully reached END and replays instead — so
+        # no summary exists for this run yet. Without this line a
+        # crash-and-resume, the case the disk reconciliation in
+        # log_run_summary exists for, left no run_summary at all.
+        _log_summary(result, thread_id, ticker, as_of, wall_clock_start, resumed=True)
         return RunOutcome("resumed", thread_id, result=result)
 
     result = await graph.ainvoke(
         initial_state(ticker, as_of, thread_id, max_usd, wall_clock_timeout_s),
         config=config,
     )
+    _log_summary(result, thread_id, ticker, as_of, wall_clock_start, resumed=False)
+    return RunOutcome("started", thread_id, result=result)
+
+
+def _log_summary(
+    result: dict, thread_id: str, ticker: str, as_of: date,
+    wall_clock_start: float, *, resumed: bool,
+) -> None:
+    budget = result.get("budget")
+    if budget is None:
+        # Only a checkpoint from before budgets existed lacks one; there is
+        # no cap to report against.
+        return
     log_run_summary(
         run_id=result.get("run_id") or thread_id,
         ticker=ticker,
-        as_of_date=as_of,
+        # A resume keeps its checkpoint's analysis date, whatever was asked.
+        as_of_date=result.get("as_of_date") or as_of,
         events=result.get("cost_events") or [],
-        budget=result["budget"],
+        budget=budget,
         terminated_by=result.get("run_terminated_by") or RunTermination.COMPLETED,
         wall_clock_s=time.monotonic() - wall_clock_start,
+        resumed=resumed,
     )
-    return RunOutcome("started", thread_id, result=result)
 
 
 def save_vault_artifacts(result: dict, run_log: str) -> list:

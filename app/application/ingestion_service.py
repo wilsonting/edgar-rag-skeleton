@@ -62,12 +62,20 @@ class IngestionService:
         form_types: list[str] | None = None,
         limit: int | None = None,
         since: date | None = None,
+        retry_failed: bool = False,
     ) -> None:
         """
         Pull recent filings for a ticker and run them through the full pipeline.
 
         Idempotent: known filings are re-checked but not re-downloaded if
         already in their target state.
+
+        A filing marked FAILED is skipped unless `retry_failed`, in which
+        case it goes back to DISCOVERED through the domain state machine and
+        walks the pipeline again. Every step skips work already done, so a
+        retry repeats only what failed. FAILED used to be terminal: nothing
+        reset it, so one transient error (an embeddings 429, a timeout)
+        removed a filing from the index until someone edited the database.
         """
         security = await self._upsert_security(ticker)
         logger.info("Resolved %s -> security id=%s cik=%s",
@@ -92,6 +100,20 @@ class IngestionService:
 
         # Phase 2: Walk each filing forward through states
         for filing, summary in filings:
+            if filing.status == FilingStatus.FAILED:
+                if not retry_failed:
+                    logger.warning(
+                        "Filing %s is FAILED (%s) and was skipped — rerun with "
+                        "retry_failed to try it again",
+                        filing.accession_number, filing.error_message,
+                    )
+                    continue
+                logger.info(
+                    "Retrying FAILED filing %s (was: %s)",
+                    filing.accession_number, filing.error_message,
+                )
+                filing.transition_to(FilingStatus.DISCOVERED)
+                await self.filing_repo.mark_status(filing.id, FilingStatus.DISCOVERED)
             try:
                 await self._advance_filing(filing, summary, security)
             except Exception as e:
@@ -250,6 +272,13 @@ class IngestionService:
                 for s in sections
             ]
             drafts = chunk_filing(parsed)
+            # Replace, never append: see ChunkRepository.delete_for_sections.
+            cleared = await self.chunk_repo.delete_for_sections([s.id for s in sections])
+            if cleared:
+                logger.warning(
+                    "Filing %s: cleared %d chunks left by an interrupted run before re-chunking",
+                    filing.accession_number, cleared,
+                )
 
             # Map drafts back to their section_id by (section_path, order).
             # Each draft inherits from the section at the index matching

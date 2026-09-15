@@ -42,6 +42,8 @@ from pathlib import Path
 from typing import get_args, get_origin, get_type_hints
 
 import pandas as pd
+import os
+
 import pytest
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from pydantic import BaseModel
@@ -59,10 +61,14 @@ from app.agent.trading.domain.technical_report import TechnicalIndicators, Techn
 from app.agent.trading.domain.trading_state import TradingState
 from app.agent.trading.infrastructure.checkpointer import (
     ALLOWED_MSGPACK_MODULES,
-    DB_URI,
     build_checkpointer,
     build_serde,
 )
+
+# Read here rather than imported from the checkpointer: the module now reads
+# it through require_env, which RAISES when unset. This probe wants "is there
+# a database" — an absence, not an error.
+DB_URI = os.getenv("TRADING_CHECKPOINT_DB_URI")
 from app.agent.trading.infrastructure.graph import build_trading_graph
 
 FIXTURE = Path(__file__).resolve().parents[3] / "tests/fixtures/avgo_ohlcv_sample.csv"
@@ -470,7 +476,7 @@ def _stub_expensive_nodes(monkeypatch, tmp_path) -> None:
     df = pd.read_csv(FIXTURE, index_col=0)
     df.index = pd.to_datetime(df.index, utc=True)
 
-    async def fake_fundamentals(ticker: str, run_id: str | None = None, **_):
+    async def fake_fundamentals(ticker: str, as_of=None, run_id: str | None = None, **_):
         return FundamentalsReport(
             ticker=ticker,
             summary="# Stub memo",

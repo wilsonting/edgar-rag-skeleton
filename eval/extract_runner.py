@@ -76,7 +76,6 @@ async def run_extraction_eval(test_set_path: Path, k: int) -> list[ExtractionCas
         embedding_service=embedder,
         chunk_repo=ChunkRepository(),
         decomposer=QueryDecomposer(),
-        use_hybrid=True,
     )
     extractor = MetricsExtractor()
     cache = QuestionEmbeddingCache(CACHE_PATH)

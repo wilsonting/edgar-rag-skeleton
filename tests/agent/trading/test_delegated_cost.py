@@ -10,6 +10,8 @@ that actually failed: the guard can see it.
 
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 
 import app.agent.tools as tools
@@ -157,7 +159,7 @@ async def test_fundamentals_logs_one_tool_event_per_model_at_its_own_rate(monkey
         ("gpt-5.6-luna", TokenUsage(input_tokens=2_000, output_tokens=300)),
     ))
 
-    report = await port.get_fundamentals_report("ACN", run_id="r1")
+    report = await port.get_fundamentals_report("ACN", date(2026, 8, 19), run_id="r1")
 
     by_model = {e.model: e for e in report.tool_cost_events}
     assert set(by_model) == {"deepseek-v4-flash", "gpt-5.6-luna"}
@@ -182,7 +184,7 @@ async def test_legacy_usage_is_priced_at_the_agent_model(monkeypatch):
     tools._record_delegated_usage(
         _Resp({USAGE_HEADER: TokenUsage(input_tokens=10).model_dump_json()})
     )
-    report = await port.get_fundamentals_report("ACN", run_id="r1")
+    report = await port.get_fundamentals_report("ACN", date(2026, 8, 19), run_id="r1")
     assert [e.model for e in report.tool_cost_events] == [port.AGENT_MODEL]
 
 

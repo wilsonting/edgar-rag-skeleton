@@ -16,10 +16,20 @@ Usage:
     uv run python -m app.agent.researcher --news AVGO "Broadcom announces 10B share repurchase"
 """
 
-from __future__ import annotations  
+from __future__ import annotations
+
+if __name__ == "__main__":
+    # Run as a script, this module is its own entry point: load .env before
+    # the imports below read their settings. Imported as a library it leaves
+    # that to whichever entry point imported it (see app/config.py).
+    from app.config import load_env
+
+    load_env()
+
 import argparse
 import asyncio
 import contextlib
+from contextvars import ContextVar
 import json
 import logging
 import os
@@ -28,19 +38,20 @@ import sys
 from typing import Callable
 import yaml
 
-from dotenv import load_dotenv
-from datetime import datetime
+from datetime import date, datetime
 from app.agent.prompts import ANALYST_SYSTEM_PROMPT, STEP1_TEST_PROMPT, NEWS_ASSESSMENT_PROMPT
 from app.agent.tools import TOOLS, execute_tool, get_calc_results, get_provenance_corpus, get_session_log, get_unretried_rejected_calcs, record_log_line, reset_run_provenance
 from app.application.memo_verifier import verify_memo
+from app.domain.values import normalize_ticker
 from app.infrastructure.llm import MODEL_PRICING, get_client
 from app.infrastructure.llm.models import model_for
+from app.config import require_env
+from app.infrastructure.cost_log_path import cost_log_path
 
-load_dotenv()
 logger = logging.getLogger(__name__)
 
 AGENT_MODEL = model_for("agent")
-MAX_TURNS = int(os.environ["LOOP_MAX_TURNS"])
+MAX_TURNS = int(require_env("LOOP_MAX_TURNS"))
 # How many turns out from the cap the agent starts being told to wrap up.
 # Phase 9 measured 2 of 3 fundamentals runs hitting MAX_TURNS exactly and
 # ending on "forcing memo from gathered data" — the agent had no idea the
@@ -56,7 +67,7 @@ TURN_WARN_AT = 8
 # the non-streaming client's read timeout.
 AGENT_MAX_TOKENS = 16000
 WATCHLIST_PATH = Path("watchlist.yaml")
-MEMO_DIR = Path.home() / os.environ["MEMO_DIR"]
+MEMO_DIR = Path.home() / require_env("MEMO_DIR")
 
 # Cost config — per million tokens. The table moved to
 # app/infrastructure/llm/pricing.py when the provider layer landed, because
@@ -64,6 +75,14 @@ MEMO_DIR = Path.home() / os.environ["MEMO_DIR"]
 # under the old name so the three ports and the budget assertions that import
 # `_MODEL_PRICING` from here keep working.
 _MODEL_PRICING = MODEL_PRICING
+
+
+def _ticker_arg(value: str) -> str:
+    """argparse `type=` for a ticker: normalized, or a clean usage error."""
+    try:
+        return normalize_ticker(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from e
 
 
 def _trace(msg: str) -> None:
@@ -120,7 +139,7 @@ def _build_news_prompt(ticker: str, news_text: str) -> str:
 
 # Modes whose provenance must NOT fall back to the research agent's session
 # log. These are trading-pipeline artifacts that never call the research
-# tools, so at their save time the module-global log still holds whatever
+# tools, so at their save time the session log may still hold whatever
 # trace the preceding fundamentals run left behind — writing it would pair
 # the wrong evidence with the report. They supply their own provenance or
 # get none.
@@ -158,7 +177,7 @@ _DATED_MODES = frozenset(
 
 # The instant one pipeline run started, set by `vault_run`; None outside one.
 #
-# A module global rather than a parameter threaded through six ports, because
+# A context variable rather than a parameter threaded through six ports, because
 # the two halves of a run save at different times and through different call
 # stacks — technical and fundamentals from inside their nodes while the graph
 # is still executing, sentiment/decision/debate from the CLI after it
@@ -169,7 +188,10 @@ _DATED_MODES = frozenset(
 # from the same instant too. A run that starts at 23:58 and finishes at
 # 00:02 would otherwise file its fundamentals under one date and its debate
 # transcript under the next — the same scattering, harder to spot.
-_RUN_STAMP: datetime | None = None
+#
+# A ContextVar and not a plain module global: the API server can run two
+# pipelines at once, and each request's task must see its own folder.
+_RUN_STAMP: ContextVar[datetime | None] = ContextVar("vault_run_stamp", default=None)
 
 
 @contextlib.contextmanager
@@ -183,13 +205,11 @@ def vault_run(stamp: datetime | None = None):
     Restores whatever was set before rather than clearing to None, so nesting
     is safe even though nothing nests today.
     """
-    global _RUN_STAMP
-    previous = _RUN_STAMP
-    _RUN_STAMP = stamp or datetime.now()
+    token = _RUN_STAMP.set(stamp or datetime.now())
     try:
-        yield _RUN_STAMP.strftime(_RUN_FOLDER_FORMAT)
+        yield _RUN_STAMP.get().strftime(_RUN_FOLDER_FORMAT)
     finally:
-        _RUN_STAMP = previous
+        _RUN_STAMP.reset(token)
 
 
 _RUN_FOLDER_FORMAT = "%Y-%m%d-%H%M%S"
@@ -215,18 +235,24 @@ def _save_output(
 
     Outside one — the standalone research CLI, which writes a single report —
     the old flat layout is kept, timestamp in the filename.
+
+    The ticker becomes a directory name, so it is validated here as well as at
+    the entry points — this is the last place that can stop a traversal.
     """
+    ticker = normalize_ticker(ticker)
     if cost_usd is not None:
         content = content.rstrip("\n") + f"\n\n---\n**LLM cost:** ${cost_usd:.4f} ({model})\n"
     # Inside a run, every path is derived from the instant the RUN started,
     # not the instant this file happens to be written.
-    now = _RUN_STAMP or datetime.now()
+
+    run_stamp = _RUN_STAMP.get()
+    now = run_stamp or datetime.now()
     stem = _MODE_STEMS.get(mode)
     parent = MEMO_DIR / ticker
     if mode in _DATED_MODES:
         parent = parent / now.strftime("%Y%m%d")
 
-    if _RUN_STAMP is not None:
+    if run_stamp is not None:
         # One folder per run, so the timestamp is on the folder and not
         # repeated on every file inside it.
         parent = parent / now.strftime(_RUN_FOLDER_FORMAT)
@@ -238,7 +264,7 @@ def _save_output(
         )
 
     out_path = parent / filename
-    if _RUN_STAMP is not None and out_path.exists():
+    if run_stamp is not None and out_path.exists():
         # Two artifacts of the same kind in one run. Unreachable today —
         # every mode is saved exactly once per run — so if it happens the
         # honest answer is to say so rather than overwrite a report that
@@ -331,7 +357,7 @@ def log_cost(
     run_id: str | None = None,
     event_id: str | None = None,
 ) -> float | None:
-    """Append one JSON line to docs/cost-log.jsonl. Returns the estimated
+    """Append one JSON line to this month's cost log. Returns the estimated
     cost (or None if pricing isn't configured), so callers can also surface
     it elsewhere (e.g. in the memo itself).
 
@@ -362,7 +388,10 @@ def log_cost(
         "output_tokens": usage.output_tokens,
         "estimated_cost_usd": cost,
     }
-    log_path = Path("docs/cost-log.jsonl")
+    # Resolved from the repo, not the working directory: this was
+    # Path("docs/cost-log.jsonl"), so a run started elsewhere wrote a log
+    # that log_run_summary's disk reconciliation never read.
+    log_path = cost_log_path()
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a") as f:
         f.write(json.dumps(entry) + "\n")
@@ -413,9 +442,110 @@ def _strip_preamble(text: str) -> str:
 
 StopCheck = Callable[[UsageSummary], "str | None"]
 
+# How many of one turn's tool calls run at once. The calls in a turn are
+# independent — the model issued them together, before seeing any result —
+# and one turn routinely carries several: gpt-5.6-luna sent 6-8 ask_edgar
+# calls per turn on 2026-09-11, each waiting 10-40 s on the server's own
+# retrieval and LLM calls. Run one after another, they made wall clock, not
+# cost, the binding constraint on a run. Not unlimited, because the run's
+# budget is re-checked before each wave: an overshoot is bounded by one wave,
+# not one turn. Set 1 for the old one-at-a-time behaviour.
+TOOL_CONCURRENCY = max(1, int(os.getenv("AGENT_TOOL_CONCURRENCY", "4")))
+# Tools that change what the others would read run alone, in call order.
+_SEQUENTIAL_TOOLS = frozenset({"ingest_ticker"})
+
+
+def _refusal(reason: str) -> str:
+    return (
+        f"RUN BUDGET REACHED: {reason}. This tool call was not made. Write the "
+        f"memo from what you have already gathered, and record anything "
+        f"incomplete under Data Gaps."
+    )
+
+
+async def _run_tool_calls(
+    blocks: list, stop_check: StopCheck | None, usage: UsageSummary
+) -> list[str]:
+    """One turn's tool calls, in waves of up to TOOL_CONCURRENCY, results in
+    call order (every tool_use needs its tool_result).
+
+    The stop check runs before each wave; once it fires, every call not yet
+    made is answered with the reason instead. A wave never spans an
+    ingest_ticker, which runs on its own.
+    """
+    results: list[str] = []
+    i = 0
+    while i < len(blocks):
+        refused = _stop_reason(stop_check, usage)
+        if refused:
+            for block in blocks[i:]:
+                _trace(f"  [tool refused] {block.name}: {refused}")
+                results.append(_refusal(refused))
+            break
+        wave = [blocks[i]]
+        if blocks[i].name not in _SEQUENTIAL_TOOLS:
+            j = i + 1
+            while (
+                j < len(blocks)
+                and len(wave) < TOOL_CONCURRENCY
+                and blocks[j].name not in _SEQUENTIAL_TOOLS
+            ):
+                wave.append(blocks[j])
+                j += 1
+        results.extend(
+            await asyncio.gather(*(execute_tool(b.name, b.input) for b in wave))
+        )
+        i += len(wave)
+    return results
+
 
 def _stop_reason(stop_check: StopCheck | None, usage: UsageSummary) -> str | None:
     return stop_check(usage) if stop_check is not None else None
+
+
+def _system_block(system_prompt: str) -> list[dict]:
+    """The system prompt as a cacheable block."""
+    return [{
+        "type": "text",
+        "text": system_prompt,
+        "cache_control": {"type": "ephemeral"},
+    }]
+
+
+async def _agent_turn(client, system_prompt: str, messages: list, *, may_call_tools: bool):
+    """One model call in the agent loop — ALWAYS the same request shape.
+
+    Every call sends `tools`, because the cached prefix is
+    tools + system + messages and dropping the tools block changes the
+    request at position zero. On Anthropic that loses the cache_control
+    prefix; on the OpenAI-compat providers this project actually runs
+    (DeepSeek, luna), caching is automatic PREFIX matching and
+    `cache_control` is stripped in translation — so an identical prefix is
+    the only thing that can produce a hit at all.
+
+    The forced-memo call at the end of the loop sent no tools and a bare
+    string system prompt. It is also the call carrying the whole
+    conversation, and Phase 9 measured 2 of 3 fundamentals runs ending on
+    it. So the largest request of the run was the one guaranteed to miss.
+
+    `may_call_tools=False` keeps the tools in the prefix while forbidding a
+    call, which is what the memo turns need: the prompt already says "do
+    not call any more tools", and tool_choice makes that true rather than
+    hoped for. It costs nothing in reasoning — this dialect's translation
+    disables thinking on any call that sends no `thinking`, which is every
+    call in this loop.
+    """
+    _roll_cache_breakpoint(messages)
+    kwargs = {
+        "model": AGENT_MODEL,
+        "max_tokens": AGENT_MAX_TOKENS,
+        "system": _system_block(system_prompt),
+        "tools": TOOLS,
+        "messages": messages,
+    }
+    if not may_call_tools:
+        kwargs["tool_choice"] = {"type": "none"}
+    return await client.messages.create(**kwargs)
 
 
 async def run_agent(
@@ -423,6 +553,7 @@ async def run_agent(
     system_prompt: str,
     *,
     stop_check: StopCheck | None = None,
+    as_of: date | None = None,
 ) -> tuple[str, UsageSummary]:
     """
     Run the agent loop: send task, process tool calls, return final text
@@ -438,8 +569,14 @@ async def run_agent(
     loop the way MAX_TURNS does: one final call writes the memo from what
     was gathered, so the run keeps its fundamentals artifact and overshoots
     by that one call, the same bound the edge guard documents.
+
+    `as_of` is the run's analysis date. It becomes the upper bound every
+    filing-reading tool applies to itself (app/agent/tools.py), so a
+    historical run cannot read a filing published after the date it claims
+    to analyse. None leaves the run unbounded — right for the standalone
+    CLI and for news assessment, wrong for anything the trading graph calls.
     """
-    reset_run_provenance()
+    reset_run_provenance(as_of)
     client = get_client(AGENT_MODEL)
     # The budget goes in the TASK, not the system prompt. The system block
     # carries its own cache breakpoint and is identical across every run;
@@ -466,19 +603,8 @@ async def run_agent(
         if stopped_by:
             break
         _trace(f"\n--- turn {turn + 1} ---")
-        _roll_cache_breakpoint(messages)
-        response = await client.messages.create(
-            model=AGENT_MODEL,
-            max_tokens=AGENT_MAX_TOKENS,
-            system=[
-                {
-                    "type": "text",
-                    "text": system_prompt,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            tools=TOOLS,
-            messages=messages,
+        response = await _agent_turn(
+            client, system_prompt, messages, may_call_tools=True
         )
         u = response.usage
         usage.input_tokens += u.input_tokens
@@ -519,17 +645,8 @@ async def run_agent(
                         "section."
                     ),
                 })
-                cont = await client.messages.create(
-                    model=AGENT_MODEL,
-                    max_tokens=AGENT_MAX_TOKENS,
-                    system=[
-                        {
-                            "type": "text",
-                            "text": system_prompt,
-                            "cache_control": {"type": "ephemeral"},
-                        }
-                    ],
-                    messages=messages,
+                cont = await _agent_turn(
+                    client, system_prompt, messages, may_call_tools=False
                 )
                 cu = cont.usage
                 usage.input_tokens += cu.input_tokens
@@ -552,30 +669,12 @@ async def run_agent(
             _trace(f"\n[agent finished after {turn + 1} turns]")
             return final, usage
 
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                # Asked per call, not per turn: one turn can carry several
-                # tool calls, and each ask_edgar runs its own LLM calls
-                # server-side. Every tool_use still needs a tool_result, so
-                # a refused call answers with the reason instead.
-                refused = _stop_reason(stop_check, usage)
-                if refused:
-                    result = (
-                        f"RUN BUDGET REACHED: {refused}. This tool call was not "
-                        f"made. Write the memo from what you have already "
-                        f"gathered, and record anything incomplete under Data Gaps."
-                    )
-                    _trace(f"  [tool refused] {block.name}: {refused}")
-                else:
-                    result = await execute_tool(block.name, block.input)
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    }
-                )
+        tool_blocks = [b for b in response.content if b.type == "tool_use"]
+        results = await _run_tool_calls(tool_blocks, stop_check, usage)
+        tool_results = [
+            {"type": "tool_result", "tool_use_id": block.id, "content": result}
+            for block, result in zip(tool_blocks, results)
+        ]
 
         messages.append({"role": "assistant", "content": response.content})
         # Tool-result blocks must come first in a user message; a trailing
@@ -618,11 +717,8 @@ async def run_agent(
             "that the tool budget was exhausted. Do not call any more tools."
         )
     messages.append({"role": "user", "content": budget_note})
-    response = await client.messages.create(
-        model=AGENT_MODEL,
-        max_tokens=AGENT_MAX_TOKENS,
-        system=system_prompt,
-        messages=messages,
+    response = await _agent_turn(
+        client, system_prompt, messages, may_call_tools=False
     )
     u = response.usage
     usage.input_tokens += u.input_tokens
@@ -645,7 +741,7 @@ async def run_agent(
 def main() -> None:
     parser = argparse.ArgumentParser(description="EDGAR research agent")
     parser.add_argument(
-        "ticker", nargs="?", help="Ticker to research (omit with --test)"
+        "ticker", nargs="?", type=_ticker_arg, help="Ticker to research (omit with --test)"
     )
     parser.add_argument(
         "--test",
@@ -664,6 +760,11 @@ def main() -> None:
     if args.test:
         task += "Run the test task described in your instructions."
         prompt = STEP1_TEST_PROMPT
+        # Assigned on every branch. It was not: `--test` left it unbound and
+        # the `mode != "test"` check below raised UnboundLocalError after the
+        # run had already completed — on the flag this module's own docstring
+        # advertises first.
+        mode = "test"
     elif args.ticker and args.news:
         ticker = args.ticker.upper()
         prompt = _build_news_prompt(ticker, args.news)

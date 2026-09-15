@@ -6,7 +6,10 @@ services:
       - POSTGRES_PASSWORD=dev
       - POSTGRES_DB=rag
     ports:
-      - 6432:5432
+      # Loopback only. Published as plain 6432:5432, Docker listens on every
+      # interface, so anyone on the same network could reach a database
+      # whose password is "dev".
+      - 127.0.0.1:6432:5432
     volumes:
       - postgres_data:/var/lib/postgresql/data
 

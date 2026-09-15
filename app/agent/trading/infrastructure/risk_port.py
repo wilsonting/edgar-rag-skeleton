@@ -20,13 +20,16 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-import sys
 from pathlib import Path
 from typing import Literal
 
+from app.agent.trading.infrastructure.structured_call import (
+    assert_within_budget,
+    call_with_schema_retry,
+    force_crash,
+)
 from app.infrastructure.llm import LLMClient, get_client
 from app.infrastructure.llm.models import model_for, warn_if_unpriced
-from pydantic import ValidationError
 
 from app.agent.researcher import (
     UsageSummary,
@@ -34,7 +37,6 @@ from app.agent.researcher import (
     log_cost,
 )
 from app.agent.trading.application.risk_ledger import build_slate, contested_ids
-from app.agent.trading.application.risk_router import RISK_MAX_TURNS
 from app.agent.trading.domain.debate import DebateTurn, canonical_claims
 from app.agent.trading.domain.sanitize import EXTERNAL_TEXT_FRAMING
 from app.agent.trading.infrastructure.cost_log import new_event_id, record_cost_event
@@ -81,10 +83,7 @@ _CRASH_WHEN = os.getenv("RISK_CRASH_WHEN", "before")
 def _maybe_crash(turn_index: int, when: str) -> None:
     if _CRASH_AT is None or int(_CRASH_AT) != turn_index or _CRASH_WHEN != when:
         return
-    print(f"[risk] FORCED CRASH {when} turn {turn_index} (RISK_CRASH_AT_TURN)")
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(1)
+    force_crash("risk", f"{when} turn {turn_index} (RISK_CRASH_AT_TURN)")
 
 
 def turn_phase(turn_index: int) -> Phase:
@@ -414,56 +413,14 @@ async def _submit(
     )
 
 
-def _accumulate(usage: UsageSummary, raw) -> None:
-    usage.input_tokens += raw.input_tokens
-    usage.cache_write_tokens += raw.cache_creation_input_tokens or 0
-    usage.cache_read_tokens += raw.cache_read_input_tokens or 0
-    usage.output_tokens += raw.output_tokens
-
-
-def _tool_block(response):
-    return next((b for b in response.content if b.type == "tool_use"), None)
-
-
-def _extract(response) -> RiskTurnPayload:
-    block = _tool_block(response)
-    if block is None:
-        raise ValidationError.from_exception_data(
-            "RiskTurnPayload", [{"type": "missing", "loc": ("submit_risk_turn",), "input": None}]
-        )
-    return RiskTurnPayload.model_validate(block.input)
-
-
-_CORRECTION = (
-    "That submission did not validate:\n{error}\n\n"
-    "Call submit_risk_turn once more, correcting exactly those fields. "
-    "Change nothing else."
-)
-
-
-def _retry_messages(messages: list[dict], response, error: Exception) -> list[dict]:
-    turns = list(messages)
-    if response.content:
-        turns.append({"role": "assistant", "content": response.content})
-    correction = _CORRECTION.format(error=error)
-    results = [
-        {"type": "tool_result", "tool_use_id": block.id, "is_error": True, "content": correction}
-        for block in response.content
-        if block.type == "tool_use"
-    ]
-    turns.append({"role": "user", "content": results or correction})
-    return turns
-
-
 def _assert_within_budget(ticker: str, turns: list[RiskTurn], this_turn: float | None) -> None:
     total = sum(t.estimated_cost_usd or 0.0 for t in turns) + (this_turn or 0.0)
-    if total > RISK_BUDGET_USD:
-        raise AssertionError(
-            f"risk panel cost ${total:.4f} for {ticker} exceeds the "
-            f"${RISK_BUDGET_USD:.2f} per-panel budget after {len(turns) + 1} "
-            f"turn(s) — check RISK_MODEL routing and the evidence pack size "
-            f"before rerunning"
-        )
+    assert_within_budget(
+        total, RISK_BUDGET_USD,
+        what="risk panel", context=f" for {ticker}",
+        budget=f"per-panel budget after {len(turns) + 1} turn(s)",
+        check="RISK_MODEL routing and the evidence pack size",
+    )
 
 
 _NORMALIZE_NONWORD = re.compile(r"[^\w\s]")
@@ -606,22 +563,14 @@ async def run_risk_turn(
     messages: list[dict] = [{"role": "user", "content": user_text}]
 
     usage = UsageSummary()
-    response = await _submit(client, system_blocks, messages, temperature)
-    _accumulate(usage, response.usage)
-    try:
-        payload = _extract(response)
-    except ValidationError as first:
-        block = _tool_block(response)
-        print(
-            f"[risk] {persona} turn {turn_index}: schema violation, one retry "
-            f"— stop_reason={response.stop_reason} "
-            f"keys={sorted(block.input) if block else None} "
-            f"— {'; '.join(str(first).splitlines()[1:5])}"
-        )
-        messages = _retry_messages(messages, response, first)
-        retry = await _submit(client, system_blocks, messages, temperature)
-        _accumulate(usage, retry.usage)
-        payload = _extract(retry)
+    payload = await call_with_schema_retry(
+        lambda msgs: _submit(client, system_blocks, msgs, temperature),
+        payload_cls=RiskTurnPayload,
+        tool_name="submit_risk_turn",
+        messages=messages,
+        usage=usage,
+        label=f"[risk] {persona} turn {turn_index}",
+    )
 
     turn, truncated = _assemble(payload, turn_index, persona, slate)
 

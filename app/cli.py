@@ -1,6 +1,11 @@
 
-import asyncio
-from dataclasses import asdict
+# Entry point: .env first, before any app import reads its settings.
+from app.config import load_env, require_env
+
+load_env()
+
+import asyncio  # noqa: E402
+from dataclasses import asdict  # noqa: E402
 import json
 import logging
 import os
@@ -8,7 +13,6 @@ from datetime import date, datetime
 from pathlib import Path
 
 import typer
-from dotenv import load_dotenv
 
 from app.application.embedding_service import EmbeddingService
 from app.application.extraction_service import MetricsExtractor
@@ -26,12 +30,16 @@ from app.infrastructure.repositories.db import close_pool, init_pool
 from app.infrastructure.repositories.document_repo import DocumentRepository
 from app.infrastructure.repositories.filing_repo import FilingRepository
 from app.infrastructure.repositories.listed_security_repo import ListedSecurityRepository
-from app.infrastructure.repositories.metrics_repo import MetricsRepository
+from app.application.citations import format_citation_tag
+from eval.runner import DEFAULT_MODE
+from app.infrastructure.repositories.metrics_repo import (
+    FinancialMetricsRow,
+    MetricsRepository,
+)
 from app.infrastructure.repositories.section_repo import SectionRepository
 from eval.extraction_report import serialize_extraction_result
 from eval.runner import serialize_result
 
-load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 app = typer.Typer()
@@ -120,9 +128,12 @@ def ingest_cmd(
     form_type: str = typer.Option("10-K", "--type"),
     limit: int = typer.Option(4, "--limit"),
     since_year: int | None = typer.Option(None, "--since"),
+    retry_failed: bool = typer.Option(
+        False, "--retry-failed", help="Re-run filings a previous ingest marked FAILED."
+    ),
 ):
     """Run the full ingestion pipeline for one ticker."""
-    asyncio.run(_ingest(ticker, form_type, limit, since_year))
+    asyncio.run(_ingest(ticker, form_type, limit, since_year, retry_failed))
 
 @app.command(name="corpus-status")
 def corpus_status_cmd(
@@ -135,11 +146,18 @@ def corpus_status_cmd(
 @app.command(name="eval")
 def eval_cmd(
     test_set: Path = Path("eval/test_set.yaml"),
-    decompose: bool = typer.Option(False,"--decompose"),
-    hybrid: bool = typer.Option(False,"--hybrid")
-    ):
-    """Run the evaluation harness against the current retrieval pipeline."""
-    asyncio.run(_run_eval(test_set, 10, decompose, hybrid))
+    mode: str = typer.Option(
+        DEFAULT_MODE, "--mode",
+        help="full (what /ask does) | hybrid (what extraction does) | vector (baseline)",
+    ),
+):
+    """Run the evaluation harness against the current retrieval pipeline.
+
+    Defaults to `full`, the path POST /ask actually takes. The old
+    --decompose/--hybrid flags selected two paths nothing in production
+    used, and no flag combination could reach the real one.
+    """
+    asyncio.run(_run_eval(test_set, 10, mode))
 
 @app.command(name="eval-extraction")
 def eval_extraction_cmd(
@@ -160,7 +178,7 @@ def extract_metrics_cmd(
 
 # ----------------------- Definitions -----------------------
 async def _fetch(ticker: str, form_type: str, limit: int, since_year: int | None) -> None:
-    user_agent = os.environ["EDGAR_USER_AGENT"]  # "Wilson Ting wilson@example.com"
+    user_agent = require_env("EDGAR_USER_AGENT")   # "Wilson Ting wilson@example.com"
     cache_root = Path(os.environ.get("EDGAR_CACHE_DIR", "./data/edgar-cache"))
 
     resolver = TickerResolver(user_agent, cache_root / "company_tickers.json")
@@ -188,13 +206,13 @@ def _prune_old_results(prefix: str, keep: int = 10) -> None:
         stale.unlink()
 
 
-async def _run_eval(test_set_path: Path, k, use_decomposition: bool, use_hybrid: bool = False) -> None:
+async def _run_eval(test_set_path: Path, k, mode: str) -> None:
     from eval.runner import run_eval
     from eval.report import report
 
     await init_pool()
     try:
-        results = await run_eval(test_set_path, k, use_decomposition, use_hybrid)
+        results = await run_eval(test_set_path, k, mode)
         print(report(results))
 
         # Save raw results for diffing across runs
@@ -349,9 +367,10 @@ def _print_per_filing(rows: list[FilingDetail]) -> None:
         )
 
 async def _ingest(
-    ticker: str, form_type: str, limit: int, since_year: int | None
+    ticker: str, form_type: str, limit: int, since_year: int | None,
+    retry_failed: bool = False,
 ) -> None:
-    user_agent = os.environ["EDGAR_USER_AGENT"]
+    user_agent = require_env("EDGAR_USER_AGENT")
     cache_root = Path(os.environ.get("EDGAR_CACHE_DIR", "./data/edgar-cache"))
 
     await init_pool()
@@ -379,50 +398,88 @@ async def _ingest(
                 form_types=[form_type],
                 limit=limit,
                 since=since,
+                retry_failed=retry_failed,
             )
     finally:
         await close_pool()
 
 async def _run_extract_metrics(ticker: str, k: int) -> None:
-    embedder = EmbeddingService()
-    chunk_repo = ChunkRepository()
-    decomposer = QueryDecomposer()
-    retrieval = RetrievalService(
-        embedding_service=embedder,
-        chunk_repo=chunk_repo,
-        decomposer=decomposer,
-        use_hybrid=True,
-    )
-    extractor = MetricsExtractor()
-    metrics_repo = MetricsRepository(session_factory=None)
-    filing_repo = FilingRepository()
+    """Extract and store metrics for every embedded filing of one ticker.
 
-    filings = await filing_repo.list_by_state(ticker, FilingStatus.INGESTED)
-    if not filings:
-        typer.echo(f"No ingested filings found for {ticker.upper()}")
-        raise typer.Exit(1)
+    This command had never run. It called `FilingStatus.INGESTED` (no such
+    member), `filing_repo.list_by_state` and `.set_state` (neither exists),
+    read `f.fiscal_period` off a Filing (which has `period_of_report`), and
+    passed the extractor's own model to `MetricsRepository.upsert`, which
+    needs the row type. Five failures, none of them caught, because no test
+    touched any CLI command.
+    """
+    await init_pool()
+    try:
+        embedder = EmbeddingService()
+        chunk_repo = ChunkRepository()
+        decomposer = QueryDecomposer()
+        retrieval = RetrievalService(
+            embedding_service=embedder,
+            chunk_repo=chunk_repo,
+            decomposer=decomposer,
+        )
+        extractor = MetricsExtractor()
+        metrics_repo = MetricsRepository()
+        filing_repo = FilingRepository()
 
-    for f in filings:
-        typer.echo(f"Extracting {f.fiscal_period} ({f.filing_type}, {f.filed_date})...")
+        # EMBEDDED is where ingestion leaves a filing that finished; a
+        # filing already at METRICS_EXTRACTED is re-done on request, since
+        # the upsert refreshes rather than duplicates.
+        filings = await filing_repo.list_by_ticker_and_status(
+            ticker, [FilingStatus.EMBEDDED, FilingStatus.METRICS_EXTRACTED]
+        )
+        if not filings:
+            typer.echo(
+                f"No embedded filings found for {ticker.upper()} — "
+                f"run `ingest` first, or check `corpus-status {ticker.upper()}`."
+            )
+            raise typer.Exit(1)
 
-        chunks = await retrieval.retrieve_for_extraction(ticker, f.filed_date, k=k)
-        if not chunks:
-            typer.echo(f"  WARNING: no chunks retrieved — skipping")
-            continue
+        extracted_count = 0
+        for f in filings:
+            fiscal_period = f.fiscal_period_label()
+            typer.echo(
+                f"Extracting {fiscal_period} ({f.filing_type}, {f.filed_date})..."
+            )
 
-        metrics = await extractor.extract(chunks, ticker, f.fiscal_period, f.filing_type, f.filed_date)
-        await metrics_repo.upsert(metrics)
-        await filing_repo.set_state(f.id, FilingStatus.METRICS_EXTRACTED)
+            chunks = await retrieval.retrieve_for_extraction(ticker, f.filed_date, k=k)
+            if not chunks:
+                typer.echo("  WARNING: no chunks retrieved — skipping")
+                continue
+
+            metrics = await extractor.extract(
+                chunks, ticker, fiscal_period, f.filing_type, f.filed_date
+            )
+            await metrics_repo.upsert(FinancialMetricsRow.from_extraction(
+                metrics,
+                ticker=ticker.upper(),
+                fiscal_period=fiscal_period,
+                filing_type=f.filing_type,
+                filed_date=f.filed_date,
+                source_citations=[format_citation_tag(c) for c in chunks],
+            ))
+            await filing_repo.mark_status(f.id, FilingStatus.METRICS_EXTRACTED)
+            extracted_count += 1
+
+            typer.echo(
+                f"  revenue={metrics.revenue}M  "
+                f"gross_margin={metrics.gross_margin_pct}%  "
+                f"fcf={metrics.free_cash_flow}M  "
+                f"ndr={metrics.net_dollar_retention}  "
+                f"conf={metrics.extraction_confidence}"
+            )
 
         typer.echo(
-            f"  revenue={metrics.revenue}M  "
-            f"gross_margin={metrics.gross_margin_pct}%  "
-            f"fcf={metrics.free_cash_flow}M  "
-            f"ndr={metrics.net_dollar_retention}  "
-            f"conf={metrics.extraction_confidence}"
+            f"\nDone. {extracted_count} of {len(filings)} filing(s) "
+            f"extracted for {ticker.upper()}."
         )
-
-    typer.echo(f"\nDone. {len(filings)} filing(s) processed for {ticker.upper()}.")
+    finally:
+        await close_pool()
 
 
 # async wrapper — matches _run_eval structure

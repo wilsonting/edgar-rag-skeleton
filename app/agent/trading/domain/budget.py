@@ -61,6 +61,23 @@ class RunTermination(str, Enum):
     COMPLETED = "completed"
     BUDGET_EXCEEDED = "budget_exceeded"
     DEADLINE_EXCEEDED = "deadline_exceeded"
+    # One node's own spending cap (debate, risk panel, synthesis, news) was
+    # crossed — a typo-catcher for a model routed to the wrong price tier or
+    # a bloated evidence pack, not the run-level cap.
+    NODE_BUDGET_EXCEEDED = "node_budget_exceeded"
+
+
+class NodeBudgetExceeded(AssertionError):
+    """A port's per-node spending cap was crossed.
+
+    Raised by the ports' `_assert_within_budget` checks. Subclasses
+    AssertionError because that is what those checks raised before, and
+    callers and tests match on it. The graph (graph.py's node wrapper) turns
+    it into the same graceful abort a run-level breach gets — a partial
+    artifact, a run summary — instead of an exception that ended the process
+    with neither. The tripping call is already on disk: log_cost writes
+    before the check runs, and log_run_summary reconciles against disk.
+    """
 
 
 def total_spend(events: list[CostEvent]) -> float:

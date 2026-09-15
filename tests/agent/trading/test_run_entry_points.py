@@ -124,18 +124,39 @@ async def test_a_resume_past_its_deadline_is_refused_before_spending(summaries):
 
 
 @pytest.mark.anyio
-async def test_a_live_resume_continues_from_its_checkpoint(summaries):
+async def test_a_live_resume_continues_from_its_checkpoint_and_logs_its_summary(summaries):
+    """A resume only follows an attempt that died mid-run, so no summary
+    exists for the run yet. It used to write none either — the crash-and-
+    resume case the cost reconciliation exists for left no run_summary."""
     live = RunBudget(
         max_usd=runner.DEFAULT_MAX_USD,
         deadline_utc=datetime.now(timezone.utc) + timedelta(minutes=20),
     )
-    graph = FakeGraph(values={"ticker": "ACN", "budget": live}, next_=("technical",))
+    checkpoint_as_of = date(2026, 8, 20)
+    finished = {
+        "ticker": "ACN", "as_of_date": checkpoint_as_of, "run_id": "trading-ACN",
+        "budget": live, "cost_events": [], "decision_memo": _memo(),
+    }
+    graph = FakeGraph(
+        values={"ticker": "ACN", "budget": live}, next_=("technical",), result=finished
+    )
 
     outcome = await runner.start_or_resume(graph, "ACN", "trading-ACN", AS_OF)
 
     assert outcome.status == "resumed"
     [(inputs, _)] = graph.invocations
     assert inputs is None   # continue the checkpoint; never re-seed it
+    [summary] = summaries
+    assert summary["resumed"] is True
+    assert summary["run_id"] == "trading-ACN"
+    # The checkpoint's analysis date, not the one this call asked for.
+    assert summary["as_of_date"] == checkpoint_as_of
+
+
+@pytest.mark.anyio
+async def test_a_new_run_summary_is_not_marked_resumed(summaries):
+    await runner.start_or_resume(FakeGraph(), "ACN", "trading-ACN", AS_OF)
+    assert summaries[0]["resumed"] is False
 
 
 def test_a_subset_run_gets_its_own_default_thread():

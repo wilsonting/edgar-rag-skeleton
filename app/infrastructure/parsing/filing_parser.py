@@ -94,6 +94,28 @@ _NO_ALNUM_RE = re.compile(r"^[^A-Za-z0-9]+$")
 _PERIODIC_FORM_TYPES = {"10-K", "10-K/A", "10-Q", "10-Q/A", "20-F", "20-F/A"}
 _DOMINANT_SECTION_RATIO = 0.65
 
+# The audited financial statements of an annual report are bound after the
+# signature pages, not under the Item that nominally covers them: Item 8 (or
+# 20-F Item 18) is a one-line cross-reference and the statements themselves
+# follow Item 15/16. Slicing on Item headings alone therefore files a whole
+# balance sheet under whichever Item heading happens to precede it — in the
+# cached corpus, "Item 16 / Form 10-K Summary" for ACN and NFLX and
+# "Item 14 / Principal Accountant Fees" for MSFT, 9 of 16 annual filings.
+# The F-pages open with their own index or with the auditor's report, so that
+# heading is promoted to a section boundary.
+_FPAGES_INDEX_RE = re.compile(
+    r"^index to (?:the\s+)?(?:consolidated\s+|combined\s+|condensed\s+)?"
+    r"financial statements\s*$",
+    re.IGNORECASE,
+)
+_FPAGES_AUDIT_RE = re.compile(
+    r"^report of independent registered public accounting firm\b", re.IGNORECASE
+)
+_ANNUAL_FORM_TYPES = {"10-K", "10-K/A", "20-F", "20-F/A"}
+# The item that owns the audited statements, by form.
+_FPAGES_ITEM = {"10-K": "8", "10-K/A": "8", "20-F": "18", "20-F/A": "18"}
+_FPAGES_TITLES = ("Financial Statements", "Financial Statements (F-pages)")
+
 
 def parse_filing(html_path: Path, form_type: str = "10-K") -> list[ParsedSection]:
     """
@@ -108,14 +130,24 @@ def parse_filing(html_path: Path, form_type: str = "10-K") -> list[ParsedSection
     soup = BeautifulSoup(html, "lxml")
 
     _strip_noise(soup)
-    blocks = _flatten_to_text_blocks(soup)
+    blocks, tables = _flatten_to_text_blocks(soup)
+    # Headings are found on the cell-by-cell blocks, exactly as before tables
+    # were rendered; only section CONTENT uses the rendered tables. Collapsing
+    # tables before heading detection moved section boundaries in 14 of 44
+    # cached filings — some better, some dropping a 10-Q's financial
+    # statements — so the two are kept apart.
     item_positions = _locate_item_headings(blocks)
-    sections = _slice_sections(blocks, item_positions, form_type=form_type)
+    sections = _slice_sections(blocks, item_positions, form_type=form_type, tables=tables)
 
+    # Judge the split before promoting the F-pages, not after: splitting one
+    # oversized section in two lowers the largest section's share, and on
+    # ASML's 20-F that was enough to let a known-bad split through the check.
+    unreliable = False
     if form_type.upper() in _PERIODIC_FORM_TYPES and sections:
         total_chars = sum(len(b) for b in blocks)
         largest = max(len(s.content) for s in sections)
-        if total_chars and largest / total_chars > _DOMINANT_SECTION_RATIO:
+        unreliable = bool(total_chars) and largest / total_chars > _DOMINANT_SECTION_RATIO
+        if unreliable:
             logger.warning(
                 "Item-heading split looks unreliable for %s (one section holds "
                 "%.0f%% of document content) — falling back to a single "
@@ -126,9 +158,16 @@ def parse_filing(html_path: Path, form_type: str = "10-K") -> list[ParsedSection
                 ParsedSection(
                     section_path=["Unknown", "Full Document"],
                     order=0,
-                    content="\n\n".join(blocks).strip(),
+                    content=_join_blocks(blocks, tables).strip(),
                 )
             ]
+
+    if not unreliable:
+        with_fpages = _add_fpages_heading(blocks, item_positions, form_type)
+        if with_fpages is not item_positions:
+            sections = _slice_sections(
+                blocks, with_fpages, form_type=form_type, tables=tables
+            )
 
     logger.info("Extracted %d non-empty sections", len(sections))
     return sections
@@ -145,16 +184,28 @@ def _strip_noise(soup: BeautifulSoup) -> None:
     for tag in soup.find_all(style=re.compile(r"display\s*:\s*none", re.IGNORECASE)):
         tag.decompose()
 
-def _flatten_to_text_blocks(soup: BeautifulSoup) -> list[str]:
+def _flatten_to_text_blocks(soup: BeautifulSoup) -> tuple[list[str], list[tuple[int, str] | None]]:
     """
     Walk the document and return a list of cleaned text blocks in order.
 
     A 'block' is roughly a paragraph or heading — text from a <p>, <div>,
     <h*>, <li>, or <td>. Whitespace is normalized. Empty blocks dropped.
+
+    Also returns, parallel to the blocks, the data table each block belongs
+    to — (table id, the table rendered one row per line) — or None. Emitted
+    cell by cell, a cash-flow statement reached the chunker as "Net income /
+    $ / 7,832,400 / $ / 7,419,197 / ..." one cell per paragraph, with nothing
+    tying a number to its row or its year, and the chunker then split it with
+    the column headings on one side of the cut and the totals on the other.
+    On 2026-09-11 answer models reported ACN's operating-cash-flow rows "not
+    in the excerpts" while they were. `_join_blocks` puts the rendered table
+    in place of its cells when section content is assembled.
     """
     BLOCK_TAGS = {"p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td", "tr", "section"}
     seen_ids: set[int] = set()
     blocks: list[str] = []
+    tables: list[tuple[int, str] | None] = []
+    rendered: dict[int, str | None] = {}   # table id -> rendering, None if not a data table
 
     for tag in soup.find_all(BLOCK_TAGS):
         # Avoid double-counting nested blocks; only emit at the leaf level
@@ -169,8 +220,96 @@ def _flatten_to_text_blocks(soup: BeautifulSoup) -> list[str]:
             continue
         seen_ids.add(id(tag))
         blocks.append(text)
+        tables.append(_data_table_of(tag, rendered))
 
-    return blocks
+    return blocks, tables
+
+
+def _data_table_of(tag, rendered: dict[int, str | None]) -> tuple[int, str] | None:
+    """The outermost data table `tag` sits in, rendered — or None."""
+    outer = None
+    for table in tag.find_parents("table"):
+        outer = table
+    if outer is None:
+        return None
+    key = id(outer)
+    if key not in rendered:
+        rendered[key] = _render_table(outer) if _is_data_table(outer) else None
+    return (key, rendered[key]) if rendered[key] else None
+
+
+def _join_blocks(blocks: list[str], tables: list[tuple[int, str] | None] | None) -> str:
+    """Blocks joined as paragraphs, each data table's run of cell blocks
+    replaced by the table rendered once, where its first cell was."""
+    if tables is None:
+        return "\n\n".join(blocks)
+    parts: list[str] = []
+    emitted: set[int] = set()
+    for text, table in zip(blocks, tables):
+        if table is None:
+            parts.append(text)
+        elif table[0] not in emitted:
+            emitted.add(table[0])
+            parts.append(table[1])
+    return "\n\n".join(parts)
+
+
+_NUMERIC_CELL = re.compile(r"^\(?-?[\d,]+(?:\.\d+)?\)?%?$")
+_CURRENCY_ONLY = {"$", "€", "£", "¥"}
+
+
+def _own_rows(table) -> list:
+    """<tr> elements belonging to this table, not to a table nested in it."""
+    return [tr for tr in table.find_all("tr") if tr.find_parent("table") is table]
+
+
+def _row_cells(tr) -> list[str]:
+    """A row's non-empty cells, with the currency and bracket fragments that
+    filings put in cells of their own glued back onto their numbers:
+    "$", "7,832,400" -> "7,832,400"; "(", "4,040,563", ")" -> "(4,040,563)"."""
+    cells: list[str] = []
+    open_paren = False
+    for td in tr.find_all(["td", "th"]):
+        if td.find_parent("tr") is not tr:
+            continue
+        text = re.sub(r"\s+", " ", td.get_text(" ", strip=True)).strip()
+        text = re.sub(r"\(\s+", "(", re.sub(r"\s+\)", ")", text))
+        if not text or text in _CURRENCY_ONLY:
+            continue
+        if text == "(":
+            open_paren = True
+            continue
+        if text in {")", "%", ")%"} and cells:
+            cells[-1] += text
+            continue
+        if open_paren:
+            text, open_paren = "(" + text, False
+        cells.append(text)
+    return cells
+
+
+def _is_data_table(table) -> bool:
+    """Two or more rows where a text label sits beside at least one number.
+    A heading laid out in a one-row table does not qualify, and neither does
+    a table of contents ("Item 7. | Management's ... | 45")."""
+    data_rows = 0
+    for tr in _own_rows(table):
+        cells = _row_cells(tr)
+        if len(cells) >= 2 and not _NUMERIC_CELL.match(cells[0]) and any(
+            _NUMERIC_CELL.match(c) for c in cells[1:]
+        ):
+            if re.match(r"^(part\s+[ivx]+|item\s+\d)", cells[0], re.I):
+                return False
+            data_rows += 1
+    return data_rows >= 2
+
+
+def _render_table(table) -> str:
+    """One line per row, cells joined by " | ". Rows are separated by a
+    single newline, so the table stays one paragraph for the chunker, which
+    splits paragraphs on blank lines (see section_chunker)."""
+    lines = [" | ".join(cells) for cells in (_row_cells(tr) for tr in _own_rows(table)) if cells]
+    return "\n".join(lines)
 
 def _locate_item_headings(blocks: list[str]) -> list[tuple[int, str, str]]:
     """
@@ -239,10 +378,83 @@ def _locate_item_headings(blocks: list[str]) -> list[tuple[int, str, str]]:
     located.sort(key=lambda x: x[0])
     return located
 
+def _fpages_start(blocks: list[str]) -> int | None:
+    """Where the audited statements begin: their own index if the filing has
+    one (the last such heading — the first is the table-of-contents entry),
+    otherwise the auditor's report."""
+    index_hits = [i for i, b in enumerate(blocks) if _FPAGES_INDEX_RE.match(b)]
+    if index_hits:
+        return index_hits[-1]
+    audit_hits = [i for i, b in enumerate(blocks) if _FPAGES_AUDIT_RE.match(b)]
+    return audit_hits[0] if audit_hits else None
+
+
+def _span_chars(blocks: list[str], boundaries: list[int], start: int) -> int:
+    """Characters of body between the heading at `start` and the next one."""
+    later = [b for b in boundaries if b > start]
+    end = min(later) if later else len(blocks)
+    return sum(len(b) for b in blocks[start + 1:end])
+
+
+def _add_fpages_heading(
+    blocks: list[str],
+    item_positions: list[tuple[int, str, str]],
+    form_type: str,
+) -> list[tuple[int, str, str]]:
+    """Promote the start of the F-pages to a section boundary of its own,
+    unless they already sit under the Item that covers them."""
+    form = form_type.upper()
+    if form not in _ANNUAL_FORM_TYPES or not item_positions:
+        return item_positions
+    start = _fpages_start(blocks)
+    if start is None:
+        return item_positions
+
+    item_no = _FPAGES_ITEM[form]
+    owner = [p for p in item_positions if p[0] < start]
+    if not owner or owner[-1][1] == item_no:
+        return item_positions   # already filed under Item 8 / Item 18
+
+    # Promote only when the Item that covers the statements is the one-line
+    # cross-reference that says they are bound elsewhere. MSFT prints them
+    # under Item 8 and also has an "Index to Financial Statements" further
+    # down in its exhibit list; there the existing Item 8 is the bigger of
+    # the two and the index is not where the statements start.
+    existing = next((p[0] for p in item_positions if p[1] == item_no), None)
+    boundaries = sorted(p[0] for p in item_positions) + [start]
+    if existing is not None and _span_chars(
+        blocks, sorted(p[0] for p in item_positions), existing
+    ) >= _span_chars(blocks, sorted(boundaries), start):
+        return item_positions
+
+    is_20f = form in _FORM_TYPES_20F
+    part = _item_to_part_20f(item_no) if is_20f else _ITEM_TO_PART.get(item_no, "Unknown")
+    taken = {
+        tuple([part, f"Item {no}"] + ([t] if t else []))
+        for _, no, t in item_positions
+    }
+    # Sections are keyed by their path when chunks are attached to them
+    # (ingestion_service), so the new one must not duplicate an existing path.
+    title = next(
+        (t for t in _FPAGES_TITLES if tuple([part, f"Item {item_no}", t]) not in taken),
+        None,
+    )
+    if title is None:
+        return item_positions
+
+    logger.info(
+        "Filing the F-pages under Item %s; they fell under Item %s",
+        item_no,
+        owner[-1][1],
+    )
+    return sorted(item_positions + [(start, item_no, title)])
+
+
 def _slice_sections(
     blocks: list[str],
     item_positions: list[tuple[int, str, str]],
     form_type: str = "10-K",
+    tables: list[tuple[int, str] | None] | None = None,
 ) -> list[ParsedSection]:
     """Take blocks between consecutive Item headings as one section's content."""
     is_20f = form_type.upper() in _FORM_TYPES_20F
@@ -254,7 +466,8 @@ def _slice_sections(
             else len(blocks)
         )
         body_blocks = blocks[start_idx + 1:end_idx]
-        content = "\n\n".join(body_blocks).strip()
+        body_tables = tables[start_idx + 1:end_idx] if tables is not None else None
+        content = _join_blocks(body_blocks, body_tables).strip()
         if not content:
             continue
 

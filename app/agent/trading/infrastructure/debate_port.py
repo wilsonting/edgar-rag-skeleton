@@ -37,15 +37,21 @@ from __future__ import annotations
 import copy
 import os
 import re
-import sys
 from pathlib import Path
 from typing import Any
 
 # create_with_temperature_fallback lives with the clients now, so the query
 # decomposer can use it too; re-exported for risk_port and synthesis_port.
+from app.agent.trading.infrastructure.structured_call import (
+    assert_within_budget,
+    call_with_schema_retry,
+    force_crash,
+)
+# create_with_temperature_fallback is re-exported on purpose: risk_port and
+# the determinism scripts import it from here, and several tests patch it
+# at this name. It reads as unused to a naive import scan; it is not.
 from app.infrastructure.llm import LLMClient, create_with_temperature_fallback, get_client
 from app.infrastructure.llm.models import model_for, warn_if_unpriced
-from pydantic import ValidationError
 
 from app.agent.researcher import (
     UsageSummary,
@@ -171,18 +177,9 @@ _CRASH_WHEN = os.getenv("DEBATE_CRASH_WHEN", "before")   # "before" | "after"
 
 
 def _maybe_crash(turn_index: int, when: str) -> None:
-    """os._exit, not sys.exit or raise. Both of those unwind cleanly and let
-    the framework write a shutdown checkpoint, which is a strictly easier
-    scenario than the process kill the exit criterion describes."""
     if _CRASH_AT is None or int(_CRASH_AT) != turn_index or _CRASH_WHEN != when:
         return
-    print(f"[debate] FORCED CRASH {when} turn {turn_index} (DEBATE_CRASH_AT_TURN)")
-    # os._exit skips every atexit hook and every buffered stream, so without
-    # this the crash message and the whole run's node progress are lost —
-    # which is a faithful simulation of kill -9 and a useless test log.
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(1)
+    force_crash("debate", f"{when} turn {turn_index} (DEBATE_CRASH_AT_TURN)")
 
 
 # ---------------------------------------------------------------------------
@@ -1215,82 +1212,15 @@ async def _submit(
     )
 
 
-def _accumulate(usage: UsageSummary, raw) -> None:
-    usage.input_tokens += raw.input_tokens
-    usage.cache_write_tokens += raw.cache_creation_input_tokens or 0
-    usage.cache_read_tokens += raw.cache_read_input_tokens or 0
-    usage.output_tokens += raw.output_tokens
-
-
-def _tool_block(response):
-    return next((b for b in response.content if b.type == "tool_use"), None)
-
-
-def _extract(response) -> DebateTurnPayload:
-    """Raises ValidationError on anything the retry can correct — including a
-    response with no tool call at all, which is the same class of failure as
-    a malformed one and gets the same single retry."""
-    block = _tool_block(response)
-    if block is None:
-        raise ValidationError.from_exception_data(
-            "DebateTurnPayload",
-            [{"type": "missing", "loc": ("submit_argument",), "input": None}],
-        )
-    return DebateTurnPayload.model_validate(block.input)
-
-
-_CORRECTION = (
-    "That submission did not validate:\n{error}\n\n"
-    "Call submit_argument once more, correcting exactly those fields. "
-    "Change nothing else."
-)
-
-
-def _retry_messages(messages: list[dict], response, error: Exception) -> list[dict]:
-    """Feed the validation error back in a shape the API accepts.
-
-    A `tool_use` block MUST be answered by a `tool_result` in the next
-    message — appending a plain user turn after one is a 400, which is how
-    this was found. When the model returned no tool call there is nothing to
-    answer, so the correction goes back as an ordinary user turn instead.
-    """
-    turns = list(messages)
-    if response.content:
-        turns.append({"role": "assistant", "content": response.content})
-
-    correction = _CORRECTION.format(error=error)
-    # EVERY tool_use block, not just the one that was validated. The API
-    # requires a tool_result per tool_use; answering only the first is the
-    # same 400 in a different disguise.
-    results = [
-        {
-            "type": "tool_result",
-            "tool_use_id": block.id,
-            "is_error": True,
-            "content": correction,
-        }
-        for block in response.content
-        if block.type == "tool_use"
-    ]
-    turns.append({"role": "user", "content": results or correction})
-    return turns
-
 
 def _assert_within_budget(ticker: str, turns: list[DebateTurn], this_turn: float | None) -> None:
-    """Fires as soon as the running total crosses the ceiling, not at the end.
-
-    An assertion cannot refund a turn already paid for, so the earliest
-    possible turn is the only useful place for it. What it actually catches
-    is prompt bloat or a runaway — the round cap bounds normal spend.
-    """
     total = sum(t.estimated_cost_usd or 0.0 for t in turns) + (this_turn or 0.0)
-    if total > DEBATE_BUDGET_USD:
-        raise AssertionError(
-            f"debate cost ${total:.4f} for {ticker} exceeds the "
-            f"${DEBATE_BUDGET_USD:.2f} per-debate budget after "
-            f"{len(turns) + 1} turn(s) — check DEBATE_MODEL routing and the "
-            f"evidence pack size before rerunning"
-        )
+    assert_within_budget(
+        total, DEBATE_BUDGET_USD,
+        what="debate", context=f" for {ticker}",
+        budget=f"per-debate budget after {len(turns) + 1} turn(s)",
+        check="DEBATE_MODEL routing and the evidence pack size",
+    )
 
 
 async def run_debate_turn(
@@ -1330,22 +1260,14 @@ async def run_debate_turn(
     messages: list[dict] = [{"role": "user", "content": user_text}]
 
     usage = UsageSummary()
-    response = await _submit(client, system_blocks, messages)
-    _accumulate(usage, response.usage)
-    try:
-        payload = _extract(response)
-    except ValidationError as first:
-        block = _tool_block(response)
-        print(
-            f"[debate] {side} turn {turn_index}: schema violation, one retry "
-            f"— stop_reason={response.stop_reason} "
-            f"keys={sorted(block.input) if block else None} "
-            f"— {'; '.join(str(first).splitlines()[1:5])}"
-        )
-        messages = _retry_messages(messages, response, first)
-        retry = await _submit(client, system_blocks, messages)
-        _accumulate(usage, retry.usage)
-        payload = _extract(retry)   # a second failure raises out of the node
+    payload = await call_with_schema_retry(
+        lambda msgs: _submit(client, system_blocks, msgs),
+        payload_cls=DebateTurnPayload,
+        tool_name="submit_argument",
+        messages=messages,
+        usage=usage,
+        label=f"[debate] {side} turn {turn_index}",
+    )
 
     # Structural guards, and they differ deliberately.
     #

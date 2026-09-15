@@ -78,6 +78,36 @@ class FilingRepository:
                 rows = await cur.fetchall()
         return [Filing.model_validate(r) for r in rows]
 
+    async def list_by_ticker_and_status(
+        self,
+        ticker: str,
+        statuses: list[FilingStatus],
+    ) -> list[Filing]:
+        """One ticker's filings in any of `statuses`, oldest first.
+
+        `list_by_status` covers every ticker at once, which is what the
+        ingestion pipeline wants; a per-ticker command wants this. The
+        ticker lives on listed_securities, so this joins rather than
+        filtering `filings` alone.
+
+        Oldest first because the caller is walking a company forward
+        through time, and a trend read the other way round is a trap.
+        """
+        async with get_connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT f.*
+                    FROM filings f
+                    JOIN listed_securities s ON s.id = f.security_id
+                    WHERE s.ticker = %s AND f.status = ANY(%s)
+                    ORDER BY f.filed_date ASC
+                    """,
+                    (ticker.upper(), [st.value for st in statuses]),
+                )
+                rows = await cur.fetchall()
+        return [Filing.model_validate(r) for r in rows]
+
     async def get_by_accession(self, accession_number: str) -> Filing | None:
         async with get_connection() as conn:
             async with conn.cursor() as cur:

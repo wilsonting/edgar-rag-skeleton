@@ -46,7 +46,7 @@ COST_LOG = Path("docs/cost-log.jsonl")
 # RISK_JUDGE_MODEL) while missing the ones that do select a model. A run
 # recorded against the wrong list is a run whose configuration cannot be
 # reconstructed.
-MODEL_ENV_VARS = [*model_env_vars(), "OPENAI_MODEL", "EMBEDDING_MODEL"]
+MODEL_ENV_VARS = [*model_env_vars(), "EMBEDDING_MODEL"]
 
 PINNED_PACKAGES = ["langgraph", "pandas-ta-classic", "anthropic", "pydantic"]
 

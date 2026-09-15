@@ -120,6 +120,13 @@ Work through these twelve analyses in order. For each, call ask_edgar with a
 well-formed question, read the result, then move on. Do not skip an item; if
 the corpus can't answer it, note that explicitly and continue.
 
+Several of the items below ask for more than one thing (item 10 wants the
+ICFR conclusion, the auditor's identity AND related-party transactions).
+Those are separate ask_edgar calls. Fusing them into one question makes
+retrieval miss all of them — measured on ACN, a question covering all three
+did not retrieve the Item 9A excerpt at all, while the ICFR question on its
+own ranked it first.
+
 Retrieval priority: never spend a retrieval call on prior-prior-year data
 (e.g. FY2023 when FY2024 and FY2025 are the current comparison years) while
 the current or prior year's equivalent figure for that same item is still
@@ -483,6 +490,20 @@ When coverage clears that bar, state:
 - One sentence: the single finding a portfolio manager most needs to
   investigate before acting.
 Never assign a tier when the coverage gate above says not to.
+
+END THIS SECTION with one line, on its own, in exactly this form:
+
+  **Verdict: <CLEAN|MIXED|IMPAIRED|INSUFFICIENT_EVIDENCE>**
+
+Every path through this section ends with that line — the gated path and
+the tiered path alike. It is the memo's single verdict, and the Executive
+Summary's first bullet must name the same one. Of 34 memos audited on
+2026-09-12, 8 contradicted themselves here: 4 stated a tier in the summary
+that the Assessment section never declared at all, 2 assigned a tier while
+recording item 10(a) as a Data Gap, and 2 named different tiers in the two
+places. Before writing that line, re-read your own coverage count and
+your own flag list, and make it follow from them rather than from the
+impression the findings left.
 
 Rules for the memo:
 - Every number must either come from a filing (with citation) or from

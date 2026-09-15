@@ -101,3 +101,24 @@ def decode_usage_header(raw: str) -> dict[str | None, TokenUsage]:
     if not isinstance(by_model, dict):
         raise ValueError("usage header `by_model` is not a JSON object")
     return {str(m): TokenUsage.model_validate(u) for m, u in by_model.items()}
+
+
+def response_text(response) -> str:
+    """The text a model response carries, or "" when it carries none.
+
+    `resp.content[0].text` was read unguarded in two places. A response with
+    no content blocks is not hypothetical: the OpenAI-compat adapter returns
+    none when the provider sends no text, which is what a completion cut off
+    at the token limit looks like. That surfaced as `IndexError` — a 500 from
+    /ask, and a crash in the decomposer — rather than as the empty answer it
+    actually is.
+
+    Joins every text block rather than taking the first: a response that
+    interleaves text with other block types has more than one, and reading
+    only `[0]` silently truncated it.
+    """
+    blocks = getattr(response, "content", None) or []
+    return "".join(
+        b.text for b in blocks
+        if getattr(b, "type", None) == "text" and getattr(b, "text", None)
+    )

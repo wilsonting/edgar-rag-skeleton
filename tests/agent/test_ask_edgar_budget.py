@@ -29,7 +29,7 @@ async def test_the_cap_refuses_rather_than_raises():
     memo from what it has, exactly as it does at MAX_TURNS. Raising would
     lose the whole run's work over a budget that is a preference, not a
     failure."""
-    tools._ASK_EDGAR_CALLS = tools.ASK_EDGAR_MAX_CALLS
+    tools._state().ask_edgar_calls = tools.ASK_EDGAR_MAX_CALLS
 
     result = await tools._dispatch("ask_edgar", {"question": "anything"})
 
@@ -46,7 +46,7 @@ async def test_the_refusal_makes_no_http_call(monkeypatch):
         raise AssertionError("the budget check ran too late; an HTTP call was made")
 
     monkeypatch.setattr(tools.httpx, "AsyncClient", _boom)
-    tools._ASK_EDGAR_CALLS = tools.ASK_EDGAR_MAX_CALLS
+    tools._state().ask_edgar_calls = tools.ASK_EDGAR_MAX_CALLS
 
     assert "BUDGET EXHAUSTED" in await tools._dispatch("ask_edgar", {"question": "q"})
 
@@ -61,12 +61,30 @@ def test_the_budget_is_announced_in_the_tool_description():
     assert "BUDGETED" in description
 
 
+def test_the_description_asks_for_one_question_per_call():
+    """Retrieval embeds the question as a whole, so a compound question lands
+    between its topics and matches none of them. Measured 2026-09-12 on ACN's
+    re-chunked FY2025 10-K: the agent's own three-part question (ICFR
+    conclusion + auditor identity + related-party transactions) did not
+    retrieve the Item 9A chunk in the top 8, while "Did management conclude
+    that internal control over financial reporting was effective as of the
+    end of fiscal 2025?" ranked that same chunk first.
+
+    The description used to say the opposite — "ask one broad question that
+    covers several checklist items" — which is where the compound questions
+    came from."""
+    description = next(t for t in tools.TOOLS if t["name"] == "ask_edgar")["description"]
+
+    assert "ONE QUESTION PER CALL" in description
+    assert "one broad question" not in description
+
+
 def test_the_counter_is_per_run():
     """Fenced by the same call that fences every other per-run accumulator
     in this module, or run two starts already spent."""
-    tools._ASK_EDGAR_CALLS = 17
+    tools._state().ask_edgar_calls = 17
     tools.reset_run_provenance()
-    assert tools._ASK_EDGAR_CALLS == 0
+    assert tools._state().ask_edgar_calls == 0
 
 
 def test_the_cap_is_configurable_without_a_code_change():
@@ -83,13 +101,13 @@ async def test_the_last_permitted_call_is_the_nth_not_the_nth_minus_one(monkeypa
     the check is `>= cap` against a counter incremented AFTER the check
     passes. Stubbed transport so this asserts the boundary, not the network."""
     monkeypatch.setattr(tools, "USE_STUBS", True)
-    tools._ASK_EDGAR_CALLS = tools.ASK_EDGAR_MAX_CALLS - 1
+    tools._state().ask_edgar_calls = tools.ASK_EDGAR_MAX_CALLS - 1
 
     allowed = await tools._dispatch("ask_edgar", {"question": "the Nth call"})
     assert "BUDGET EXHAUSTED" not in allowed
-    assert tools._ASK_EDGAR_CALLS == tools.ASK_EDGAR_MAX_CALLS
+    assert tools._state().ask_edgar_calls == tools.ASK_EDGAR_MAX_CALLS
 
     refused = await tools._dispatch("ask_edgar", {"question": "the N+1th"})
     assert "BUDGET EXHAUSTED" in refused
     # A refused call must not consume budget it never used.
-    assert tools._ASK_EDGAR_CALLS == tools.ASK_EDGAR_MAX_CALLS
+    assert tools._state().ask_edgar_calls == tools.ASK_EDGAR_MAX_CALLS

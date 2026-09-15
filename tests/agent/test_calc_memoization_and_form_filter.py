@@ -104,9 +104,9 @@ async def test_a_repeat_does_not_double_record_the_calc_result():
 
 
 def test_the_cache_is_per_run():
-    tools._CALC_CACHE["x"] = "1"
+    tools._state().calc_cache["x"] = "1"
     tools.reset_run_provenance()
-    assert tools._CALC_CACHE == {}
+    assert tools._state().calc_cache == {}
 
 
 # --- check_latest_filings narrowing ---------------------------------------

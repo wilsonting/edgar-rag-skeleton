@@ -166,6 +166,151 @@ def test_dominant_section_fallback_not_applied_to_event_driven_forms(tmp_path):
     assert sections[0].section_path != ["Unknown", "Full Document"]
 
 
+# ---- the F-pages ----
+#
+# An annual report's audited statements are bound after the signature pages,
+# while Item 8 (20-F: Item 18) is a one-line cross-reference. Slicing on Item
+# headings alone therefore files a whole balance sheet under whichever Item
+# happens to precede it — "Item 16 / Form 10-K Summary" for ACN and NFLX,
+# "Item 14 / Principal Accountant Fees" for MSFT, 9 of 16 annual filings in
+# the cached corpus.
+
+def _filler(label: str, n: int = 80) -> str:
+    return " ".join(f"{label} sentence {i} of the annual report." for i in range(n))
+
+
+# Enough balancing prose that no single section dominates the document and
+# trips the whole-document fallback, which is exercised separately below.
+def _stub_10k(tail: list[str]) -> list[str]:
+    return [
+        "Item 1. Business",
+        _filler("Business"),
+        "Item 7. Management's Discussion and Analysis",
+        _filler("Discussion"),
+        "Item 8. Financial Statements and Supplementary Data",
+        "See Index to Consolidated Financial Statements.",
+        "Item 16. Form 10-K Summary",
+        "Not applicable.",
+    ] + tail
+
+
+_STATEMENTS = [
+    "Index to Consolidated Financial Statements",
+    " ".join(f"Balance sheet line {i} with 1,234,5{i:02d} reported." for i in range(80)),
+]
+
+
+def test_fpages_after_the_last_item_get_their_own_section(tmp_path):
+    sections = parse_filing(_write_html(tmp_path, _stub_10k(_STATEMENTS)), form_type="10-K")
+
+    fs = next(s for s in sections if s.section_path[-1] == "Financial Statements")
+    assert fs.section_path == ["Part II", "Item 8", "Financial Statements"]
+    assert "Balance sheet line 0" in fs.content
+    # and they are no longer filed under the Form 10-K Summary
+    summary = next(s for s in sections if s.section_path[1] == "Item 16")
+    assert "Balance sheet line 0" not in summary.content
+
+
+def test_fpages_not_promoted_when_item_8_already_holds_them(tmp_path):
+    """MSFT prints its statements under Item 8 and has an "Index to Financial
+    Statements" further down in its exhibit list; that index is not where the
+    statements start, and Item 8 is the bigger of the two."""
+    blocks = [
+        "Item 1. Business",
+        _filler("Business"),
+        "Item 8. Financial Statements and Supplementary Data",
+        " ".join(f"Balance sheet line {i} with 1,234,5{i:02d} reported." for i in range(80)),
+        "Item 15. Exhibits, Financial Statement Schedules",
+        "Index to Financial Statements",
+        "Schedule II is filed as part of this report.",
+    ]
+    sections = parse_filing(_write_html(tmp_path, blocks), form_type="10-K")
+
+    assert not any(s.section_path[-1] == "Financial Statements" for s in sections)
+    item_8 = next(s for s in sections if s.section_path[1] == "Item 8")
+    assert "Balance sheet line 0" in item_8.content
+
+
+def test_fpages_use_the_auditors_report_when_there_is_no_index(tmp_path):
+    tail = [
+        "Report of Independent Registered Public Accounting Firm",
+        " ".join(f"Audit paragraph {i} on the statements." for i in range(80)),
+    ]
+    sections = parse_filing(_write_html(tmp_path, _stub_10k(tail)), form_type="10-K")
+
+    fs = next(s for s in sections if s.section_path[-1] == "Financial Statements")
+    assert "Audit paragraph 0" in fs.content
+
+
+def test_fpages_of_a_20f_are_filed_under_item_18(tmp_path):
+    blocks = [
+        "Item 4. Information on the Company",
+        _filler("Company"),
+        "Item 5. Operating and Financial Review",
+        _filler("Review"),
+        "Item 19. Exhibits",
+        "The following exhibits are filed.",
+        "Index to Consolidated Financial Statements",
+        " ".join(f"Balance sheet line {i} with 1,234,5{i:02d} reported." for i in range(80)),
+    ]
+    sections = parse_filing(_write_html(tmp_path, blocks), form_type="20-F")
+
+    fs = next(s for s in sections if s.section_path[-1] == "Financial Statements")
+    assert fs.section_path == ["Part III", "Item 18", "Financial Statements"]
+
+
+def test_fpages_title_avoids_colliding_with_an_existing_section_path(tmp_path):
+    """Chunks are attached to their section by path (ingestion_service), so a
+    duplicate path would silently merge two sections."""
+    blocks = [
+        "Item 1. Business",
+        _filler("Business"),
+        "Item 7. Management's Discussion and Analysis",
+        _filler("Discussion"),
+        "Item 8. Financial Statements",
+        "See Index to Consolidated Financial Statements.",
+        "Item 16. Form 10-K Summary",
+        "Not applicable.",
+    ] + _STATEMENTS
+    sections = parse_filing(_write_html(tmp_path, blocks), form_type="10-K")
+
+    paths = [tuple(s.section_path) for s in sections]
+    assert len(paths) == len(set(paths))
+    assert ("Part II", "Item 8", "Financial Statements (F-pages)") in paths
+
+
+def test_fpages_not_promoted_for_quarterly_reports(tmp_path):
+    blocks = [
+        "Item 2. Management's Discussion and Analysis",
+        " ".join(f"Quarterly sentence {i}." for i in range(60)),
+        "Report of Independent Registered Public Accounting Firm",
+        " ".join(f"Review paragraph {i}." for i in range(40)),
+    ]
+    sections = parse_filing(_write_html(tmp_path, blocks), form_type="10-Q")
+
+    assert not any(s.section_path[-1] == "Financial Statements" for s in sections)
+
+
+def test_whole_document_fallback_still_wins_over_the_fpages_split(tmp_path):
+    """Splitting one oversized section in two lowers the largest section's
+    share of the document, which was enough to let ASML's known-bad 20-F
+    split through the reliability check."""
+    filler = " ".join(f"Sentence {i} of unrelated integrated annual report content." for i in range(400))
+    blocks = [
+        "Item 1",
+        "Discussion of the management report and adoption of the financial statements.",
+        "Item 2",
+        "Discussion of the dividend policy.",
+        filler,
+        "Report of Independent Registered Public Accounting Firm",
+        " ".join(f"Audit paragraph {i} on the statements." for i in range(80)),
+    ]
+    sections = parse_filing(_write_html(tmp_path, blocks), form_type="20-F")
+
+    assert len(sections) == 1
+    assert sections[0].section_path == ["Unknown", "Full Document"]
+
+
 # ---- 10-K regression (unchanged behavior) ----
 
 def test_10k_part_bucketing_still_uses_four_part_scheme(tmp_path):

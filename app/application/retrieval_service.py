@@ -1,3 +1,4 @@
+import asyncio
 from datetime import date
 import logging
 
@@ -10,6 +11,43 @@ from app.infrastructure.repositories.chunk_repo import (
 from .embedding_service import EmbeddingService
 
 logger = logging.getLogger(__name__)
+
+
+def _fuse_across_queries(
+    per_query: list[list[RetrievedChunk]], k: int
+) -> list[RetrievedChunk]:
+    """Fuse several sub-queries' result lists into one ranking.
+
+    Scores are SUMMED across sub-queries, not maxed. Each list is already
+    RRF-fused within its own query, and an RRF score is rank-derived: taking
+    the max across queries means "the best rank this chunk reached in any
+    sub-query", which scores a chunk every sub-query ranked third exactly
+    the same as one that a single sub-query ranked third and the rest missed
+    entirely. Agreement across sub-queries is the whole reason to decompose
+    a question, and the max threw it away.
+
+    Summing is RRF's own rule applied one level up: a chunk answering two
+    halves of a two-part question outranks one answering only a half.
+    """
+    scores: dict[int, float] = {}
+    best: dict[int, RetrievedChunk] = {}
+    for results in per_query:
+        for chunk in results:
+            cid = chunk.chunk.id
+            scores[cid] = scores.get(cid, 0.0) + chunk.similarity
+            # Keep the instance with the strongest single-query showing, so
+            # `vector_similarity` is the best one this chunk actually got.
+            if cid not in best or chunk.similarity > best[cid].similarity:
+                best[cid] = chunk
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:k]
+    return [
+        RetrievedChunk(
+            chunk=best[cid].chunk,
+            similarity=score,
+            vector_similarity=best[cid].vector_similarity,
+        )
+        for cid, score in ranked
+    ]
 
 
 class RetrievalService:
@@ -32,12 +70,15 @@ class RetrievalService:
         embedding_service: EmbeddingService,
         chunk_repo: ChunkRepository,
         decomposer: QueryDecomposer | None = None,
-        use_hybrid: bool = False,
     ):
+        # `use_hybrid` used to be a fourth argument. It was stored and never
+        # read by anything in this class — callers pick hybrid by CALLING
+        # retrieve_hybrid or retrieve_full — so four call sites were setting
+        # a switch wired to nothing. That is the same trap models.py's
+        # docstring describes for the two model env vars no code read.
         self.embedder = embedding_service
         self.chunk_repo = chunk_repo
         self.decomposer = decomposer
-        self.use_hybrid = use_hybrid
 
     async def retrieve(
         self,
@@ -77,52 +118,6 @@ class RetrievalService:
             logger.info("Retrieved 0 chunks (filters may be too narrow)")
 
         return results
-
-    async def retrieve_with_decomposition(
-        self,
-        question: str,
-        k: int = 8,
-        filters: ChunkSearchFilters | None = None,
-    ) -> tuple[list[RetrievedChunk], DecompositionResult]:
-        """
-        Retrieve with optional query decomposition.
-        Returns (chunks, decomposition_result) so callers can inspect sub-queries.
-        """
-        if self.decomposer is None:
-            # No decomposer configured — fall through to normal retrieval
-            chunks = await self.retrieve(question, k=k, filters=filters)
-            result = DecompositionResult(
-                original_query=question, was_decomposed=False, sub_queries=[question]
-            )
-            return chunks, result
-
-        decomposition = await self.decomposer.decompose(question)
-
-        if not decomposition.was_decomposed:
-            chunks = await self.retrieve(question, k=k, filters=filters)
-            return chunks, decomposition
-
-        # Retrieve per sub-query, merge results
-        all_chunks: dict[int, RetrievedChunk] = {}  # chunk_id -> best result
-        for sub_q in decomposition.sub_queries:
-            sub_results = await self.retrieve(sub_q, k=k, filters=filters)
-            for chunk in sub_results:
-                existing = all_chunks.get(chunk.chunk.id)
-                if existing is None or chunk.similarity > existing.similarity:
-                    all_chunks[chunk.chunk.id] = chunk
-
-        # Sort merged results by similarity, return top-k
-        merged = sorted(all_chunks.values(), key=lambda c: c.similarity, reverse=True)
-        merged = merged[:k]
-
-        logger.info(
-            "Decomposed retrieval: %d sub-queries -> %d unique chunks -> top %d returned",
-            len(decomposition.sub_queries),
-            len(all_chunks),
-            len(merged),
-        )
-
-        return merged, decomposition
 
     async def retrieve_hybrid(
         self,
@@ -226,10 +221,13 @@ class RetrievalService:
             filed_before=filed_date,
             section_path_contains=None,
         )
-        collected: list[RetrievedChunk] = []
-        for query in self.METRIC_QUERIES.values():
-            collected += await self.retrieve(query, k=k, filters=filters)
-        return self._dedupe_by_chunk_id(collected)
+        # Four fixed queries, independent of each other. They ran one at a
+        # time — the same serial pattern retrieve_full stopped using.
+        per_query = await asyncio.gather(
+            *(self.retrieve(query, k=k, filters=filters)
+              for query in self.METRIC_QUERIES.values())
+        )
+        return self._dedupe_by_chunk_id([c for results in per_query for c in results])
 
     @staticmethod
     def _dedupe_by_chunk_id(chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
@@ -263,14 +261,12 @@ class RetrievalService:
             chunks = await self.retrieve_hybrid(question, k=k, filters=filters)
             return chunks, decomposition
     
-        # Hybrid-retrieve per sub-query, merge
-        all_chunks: dict[int, RetrievedChunk] = {}
-        for sub_q in decomposition.sub_queries:
-            sub_results = await self.retrieve_hybrid(sub_q, k=k, filters=filters)
-            for chunk in sub_results:
-                existing = all_chunks.get(chunk.chunk.id)
-                if existing is None or chunk.similarity > existing.similarity:
-                    all_chunks[chunk.chunk.id] = chunk
-    
-        merged = sorted(all_chunks.values(), key=lambda c: c.similarity, reverse=True)[:k]
-        return merged, decomposition
+        # Hybrid-retrieve per sub-query, then fuse across them.
+        # Independent of each other, so concurrent: each sub-query is an
+        # embedding call plus two SQL searches, and a decomposed question has
+        # 2-4 of them. One after another they added up on every /ask the
+        # agent made.
+        per_query = await asyncio.gather(
+            *(self.retrieve_hybrid(sub_q, k=k, filters=filters) for sub_q in decomposition.sub_queries)
+        )
+        return _fuse_across_queries(per_query, k=k), decomposition

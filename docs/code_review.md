@@ -1,248 +1,258 @@
 # Code review: trading-agents
 
-**Reviewed:** `main` at `e751df3` (after #80, the per-model delegated-cost fix), 2026-09-11.
-**Scope:** `app/` (~19.6k lines with `scripts/` and `eval/`), `tests/` (~12k lines), CI, migrations, config.
-**Method:** I read the HTTP API, the research agent and its tool layer, the trading graph and nodes, the budget and cost path, the synthesis, risk and debate ports (the large heuristic guards were skimmed, not audited line by line), retrieval, the SQL repositories, ingestion, EDGAR, parsing and chunking, the verifiers, provider routing, config, and CI.
+**Reviewed:** `main` at `617387f` (after #100, the memo verdict-consistency flag), 2026-09-12.
+**Scope:** `app/` (~11.5k lines), `tests/` (~14.8k lines), `eval/`, `scripts/`, `migrations/`, CI, packaging, docs.
+**Method:** read the HTTP API, the CLI, the research agent and its tool layer, the trading graph, nodes, routers and guards, the fundamentals/technical/news/debate/risk/synthesis ports, the budget and cost path, retrieval and the SQL repositories, ingestion, EDGAR, parsing, chunking, the verifiers, provider routing and config. Ran the full suite, an AST unused-import pass, and an env-var cross-check of `.env.example` against what the code actually reads. Where a claim needed proof I reproduced it (marked **[verified]**); otherwise **[from code]**.
 
-Findings are labelled **[verified]** when I confirmed them against data, logs or a reproduction, and **[from code]** when they come from reading the code without running the failing path. No code was changed for this review.
+**Suite at review time:** `881 passed, 1 skipped in 3.49s` (the skip is `test_manifest_merge.py`, which needs a `docs/validation/` file absent from this checkout).
 
 ---
 
 ## Summary
 
-This codebase is careful about the things that usually go wrong in LLM pipelines:
-- **Point-in-time data:** `as_of_date` is enforced on every data source, with post-assertions for lookahead.
-- **Provenance:** every figure is traced back to the tool output that produced it.
-- **Accounting:** cost events are deduplicated by id, the disk log is reconciled against state, and budgets are per run.
-- **Fabrication guards:** they flag problems rather than hiding them.
-- **The "why" behind decisions:** most non-obvious choices are explained next to the code, often with the live incident that motivated them.
+The core is in good shape. Since the previous review (deleted from the tree at `4e966a7`; recoverable with `git show 0e8e80d:docs/code_review.md`) **all three High and all ten Medium findings shipped** across PRs #82–#95: the API and CLI now share one run lifecycle, the budget guard reaches inside the fundamentals loop and the synthesizer, BM25 actually returns hits, per-run state moved to ContextVars, number matching is consolidated, ingestion retries FAILED filings idempotently, and config loads `.env` exactly once per entry point. That pass left its **Low section entirely unaddressed**, and this review confirms every item in it is still open.
 
-The test suite (723 tests, CI against a real pgvector Postgres) matches that care.
+What this review adds is mostly at the edges the last one flagged and in the places the last one did not reach:
 
-The weaknesses are at the **edges** rather than the core:
-- The HTTP API was built for the CLI's workflow and has not kept up with it.
-- The budget guard can't see inside the two most expensive nodes.
-- Retrieval, which everything downstream depends on, has a hybrid search whose keyword half almost never returns results, and a chunker that splits financial tables away from their headers.
-- The guard logic that matters most, deciding whether a number is real, has four separate implementations of different strength.
+- **A shipped CLI command is broken** — `extract-metrics` raises `AttributeError` on its first filing.
+- **The fundamentals leg still reads the wall clock**, so a historical `--as-of` run has one unbounded analyst. The README names this; nothing in the code does.
+- **The eval harness measures a retrieval path production does not use**, so the numbers that justified the BM25 work do not describe `/ask`.
+- **The pre-refactor PDF pipeline is still in `app/`**, along with a Python 2.7 `.pyc` committed to git.
+- **Three ports carry a byte-identical copy of the same six helpers.**
+
+Nothing here is a security exposure: CORS is scoped, the spending endpoints take an optional shared secret, tickers are validated at every entry point including the vault writer, and Postgres is bound to loopback. Those were the previous review's #4 and they held.
 
 ### Priority list
 
 | # | Severity | Finding | Where |
 |---|---|---|---|
-| 1 | High | `/trading/analyze` spends money, then fails | `app/main.py:413-439` |
-| 2 | High | Budget and deadline guards are blind inside the fundamentals and synthesizer nodes | `graph.py`, `nodes.py:650`, `researcher.py` |
-| 3 | High | The BM25 half of hybrid retrieval returns nothing for 93% of queries | `chunk_repo.py:187` |
-| 4 | Medium | Local API: no auth, `CORS *`, unvalidated ticker used as a file path | `main.py:62`, `researcher.py:224` |
-| 5 | Medium | Financial tables are split from their headers; statements are filed under the wrong Item | chunker, parser |
-| 6 | Medium | `calculate` provenance check uses the substring matching the verifier already replaced | `tools.py:950` |
-| 7 | Medium | Ingestion: FAILED is terminal; chunking is not idempotent | `ingestion_service.py` |
-| 8 | Medium | Synthesizer and ports: one non-guard error discards already-paid samples; budget checks crash the run | `nodes.py:667`, ports |
-| 9 | Medium | `ingest_ticker` sends `limit: null`; `extract_metrics` date bounds are ignored | `tools.py:573`, `main.py:235` |
-| 10 | Medium | Resumed runs never write a `run_summary` | `cli.py:118-174` |
-| 11 | Medium | Module-level run state is unsafe in the server process | `tools.py`, `researcher.py` |
-| 12 | Medium | Config: 13 `load_dotenv` calls with mixed override; settings that look configurable but do nothing | many |
-| 13 | Medium | Wall clock is the binding constraint, and independent work runs one call at a time | `researcher.py:531`, `nodes.py:650` |
-| 14+ | Low | Dead code, duplication, small bugs and hygiene | see Low section |
+| 1 | High | `extract-metrics` CLI crashes — wrong `FinancialMetrics` type reaches the repository | `cli.py:416-424`, `metrics_repo.py` |
+| 2 | High | `as_of_date` never reaches the fundamentals leg — lookahead in every historical run | `nodes.py:103`, `fundamentals_port.py:101` |
+| 3 | Medium | Eval never exercises `retrieve_full`, the path `/ask` uses | `eval/runner.py:136-151` |
+| 4 | Medium | The forced-memo turn is billed at full price — no tools, no cache breakpoint | `researcher.py:683-690` |
+| 5 | Medium | Sub-query results are merged by max RRF, discarding cross-query agreement | `retrieval_service.py:279-285` |
+| 6 | Medium | Dead pre-refactor PDF pipeline still in `app/`; Python 2.7 `.pyc` tracked in git | `app/ingest.py`, `app/retrieve.py`, `app/db_postgres.py`, `app/db.py`, `app/chunk.py`, `app/__init__.pyc` |
+| 7 | Medium | Seven direct `os.environ[...]` / `os.getenv` reads bypass `require_env` | `main.py`, `cli.py`, `db.py`, `checkpointer.py` |
+| 8 | Medium | The cost log has two hardcoded relative paths and no rotation | `researcher.py:390`, `cost_log.py:29` |
+| 9 | Medium | `_accumulate` + five more helpers are copied across three ports | debate/risk/synthesis ports |
+| 10 | Medium | `use_hybrid` is threaded through four call sites and read by nothing | `retrieval_service.py:41` |
+| 11 | Medium | Price-fetch failures are silent; `content[0]` is unguarded; `researcher --test` crashes | price port, `llm.py`, `researcher.py:748` |
+| 12 | Low | Unused imports, unused models, `USE_STUBS` scaffolding, stale docstrings | many |
+| 13 | Low | Duplicate/diverged docs, stale README limitation, undeclared dependencies | root vs `docs/` |
+| 14 | Low | No linter, no type checker, no coverage of any CLI command in CI | `.github/workflows/tests.yml` |
 
 ---
 
 ## High
 
-### 1. `/trading/analyze` spends money, then fails [from code]
-`app/main.py:432` starts the graph with `{"ticker": ticker}` only. Compare with the CLI (`app/agent/trading/interface/cli.py:164-171`), which also passes `as_of_date`, `run_id` and `budget`, sets a `recursion_limit`, and wraps the run in `vault_run()`.
+### 1. `extract-metrics` crashes on its first filing [verified]
 
-What happens on a new thread:
-- The graph starts with `fundamentals`, which runs the full research agent. That's the most expensive node, typically $0.02–0.45 and minutes of work, and it saves a memo.
-- The next node, `technical_node`, raises `ValueError("as_of_date missing …")`. So does `news_node`. The request returns 500 after the spend.
-- **No budget means no guard.** `_guarded()` treats a missing budget as "opted out" (`graph.py:39-43`).
-- **No `run_id`** means none of the cost lines can be grouped into a run.
-- **Aborted-run crash:** even with the state fixed, `result["decision_memo"]` raises `KeyError` on a run that ended in `graceful_abort`.
-- **Long blocking request:** a full run holds one HTTP request open for 6–15 minutes.
+`app/cli.py:416-424` runs extraction and hands the result straight to the repository:
 
-No test calls any endpoint (see Testing), so nothing catches this.
+```python
+metrics = await extractor.extract(chunks, ticker, f.fiscal_period, f.filing_type, f.filed_date)
+await metrics_repo.upsert(metrics)
+```
 
-**Suggested fix:** build the initial state with one shared function used by both the CLI and the API, and pass `recursion_limit`. Either return a job id and run the graph in the background, or remove the endpoint until it's needed.
+`MetricsExtractor.extract` returns the **Pydantic** `FinancialMetrics` from `app/application/extraction_service.py` — revenue, margins, confidence, reasoning. `MetricsRepository.upsert` expects the **dataclass** `FinancialMetrics` defined in `app/infrastructure/repositories/metrics_repo.py:11`, and its first statement is `metrics.ticker.upper()`.
 
-### 2. The budget guard can't see inside the expensive nodes [from code, consistent with logged incidents]
-`check_run_guards` runs only on graph edges. Its docstring says a run can overshoot `max_usd` "by at most one call's cost" (`guards.py:33`). That holds for nodes that make a single call, but not for these two:
-- **`fundamentals`** runs `run_agent`: up to `LOOP_MAX_TURNS=45` model turns, plus up to 30 `/ask` and `/extract` calls, each of which runs its own LLM calls on the server. Neither the spend nor the deadline is checked until the node returns. The CLI already concedes this (`cli.py:60-63`: "the run-level guards can only fire between nodes, which on this graph means after the fundamentals stage has already been paid for"). The MSFT resume incident recorded there spent $0.4069 and produced no memo.
-- **`synthesizer`** runs three samples, and samples 2 and 3 each include a fresh 9-turn risk panel (`nodes.py:650-677`), all within one node.
+```
+CONFIRMED AttributeError: 'FinancialMetrics' object has no attribute 'ticker'
+has source_citations? False
+```
 
-The deadline has the same blind spot: a fundamentals loop that hangs is invisible to `deadline_utc` until it ends.
+`ticker`, `fiscal_period`, `filing_type`, `filed_date` and `source_citations` are all absent. `POST /extract` gets this right (`main.py:354-370` builds a `MetricsRow` explicitly); the CLI path never did.
 
-**Suggested fix:** pass a small "may I spend" callback (the budget plus the running total) into `run_agent`. Check it once per turn and before each `ask_edgar`, then end the loop the same way `MAX_TURNS` does, so the agent still writes a memo. In `synthesizer_node`, check the budget before each extra sample, and report a sample skipped for budget as a data gap. Then correct the docstring.
+Two things make it invisible. `metrics_repo.py:5` imports the extraction-service `FinancialMetrics` and then shadows it with its own dataclass on line 11 — the shadowed import is almost certainly where the confusion started. And no test touches any `app.cli` command: `grep -rn "app.cli" tests/` returns nothing.
 
-### 3. The keyword (BM25) half of hybrid retrieval almost never contributes [verified]
-`search_by_text` uses `plainto_tsquery('english', question)` (`chunk_repo.py:187, 215`), which joins every word with **AND**. A chunk matches only if it contains *every* word of the question.
+`_run_extract_metrics` also never calls `init_pool()` (every other CLI coroutine does); `get_connection` self-heals, so the pool is opened lazily and never closed, but the asymmetry is worth removing.
 
-The fixed metric queries are nine-word bags ("revenue gross profit cost of revenue gross margin net income loss"), and the agent's questions are long compound sentences, so this almost never matches:
-- **Server log of the 2026-09-11 split-setup ACN run:** 43 hybrid retrievals, **40 with zero BM25 hits**, 2 with one hit, 1 with five.
-- **Extraction replay:** all four `METRIC_QUERIES` logged `15 vector + 0 bm25`.
+**Fix:** have the two identically-named types stop colliding — rename the repository row to `FinancialMetricsRow`, delete the shadowed import — and build it in one shared helper both `main.extract` and `cli._run_extract_metrics` call. Add a test that runs the command against stubbed repositories.
 
-So in practice "hybrid" retrieval is vector-only, plus a wasted query. Two knock-on effects:
-- **Meaningless similarity scores:** `_reciprocal_rank_fusion` replaces cosine similarity with the RRF score (`retrieval_service.py:204`), which is what the agent sees as `sim=0.016` on every citation. Similarity tells it nothing about result quality.
-- **Merging by RRF score:** `retrieve_full` ranks results from different sub-queries by comparing their fused RRF scores.
+### 2. `as_of_date` never reaches the fundamentals leg [from code]
 
-**Suggested fix:** use `websearch_to_tsquery`, or build an OR query (`to_tsquery` with terms joined by `|`) and rank with `ts_rank_cd`. Keep the cosine similarity on the result (for example as `vector_similarity`) next to the fused rank. Measure before and after with `eval/runner.py`.
+Every other data source is bounded at the analysis date and asserts it. `price_data_port._bound_to_as_of` drops post-`as_of` bars inside both vendor helpers; `news_node` and `synthesizer_node` refuse to run without `as_of_date` rather than defaulting to today; `TradingState.as_of_date`'s own comment says a node calling `date.today()` internally "makes probe-date runs impossible to verify".
+
+The fundamentals leg does exactly that:
+
+```python
+# nodes.py:103 — as_of_date is in state, and is not passed
+report = await get_fundamentals_report(state["ticker"], run_id=..., budget=..., prior_events=...)
+
+# fundamentals_port.py:101
+today = date.today()
+task = f"Today's date is {today.isoformat()}. Run the full research checklist for {ticker}."
+```
+
+`get_fundamentals_report` has no `as_of` parameter at all. `today` also becomes `FundamentalsReport.generated_at`. So a run invoked with `--as-of 2026-03-01` produces a memo whose news and prices stop at March and whose fundamentals research reads whatever is in the corpus and on EDGAR today — and the memo does not say so. That is lookahead bias in the one analyst whose output carries the most weight.
+
+Two related hazards in the same file:
+
+- `_cache_path(ticker)` keys the fundamentals cache on **ticker alone**. It is written on every real run (`fundamentals_port.py:153-154`) and read only under `MOCK_FUNDAMENTALS=1`. One environment variable pairs a months-old memo with any analysis date.
+- The cache directory is `app/agent/trading/.fundamentals_cache` — inside the source tree.
+
+**Fix:** thread `as_of` from `TradingState` into `get_fundamentals_report`, put it in the task prompt, and set `generated_at` from it. Key the cache on `(ticker, as_of)`, and either move it under `MEMO_DIR` or gate the *write* on `MOCK_FUNDAMENTALS` too. Until the agent's retrieval can be bounded by filing date, have the port add an explicit data gap saying the fundamentals leg is not point-in-time.
 
 ---
 
 ## Medium
 
-### 4. Local API: no auth, wide-open CORS, unvalidated ticker used in file paths [from code]
-- `allow_origins=["*"]` with `allow_headers=["*"]` and no authentication (`main.py:60-65`). A browser page on any origin can send cross-origin requests to `http://localhost:8000/ingest`, `/ask`, `/extract`, `/news-assess` and `/trading/analyze`, and each of those spends API credits. Browsers' local-network protections may block some of this, depending on browser and version, but the server itself grants permission.
-- The ticker is never validated. It goes from `TradingAnalysisRequest` to `_save_output`, where `parent = MEMO_DIR / ticker` (`researcher.py:224`) accepts `../`. `Path.home()/'memos'/'../../../TMP/X'` resolves outside the vault, and `.upper()` doesn't stop that on macOS's case-insensitive filesystem. The fundamentals node saves before the `/trading/analyze` failure in #1, so this is reachable today.
-- `docker-compose.yml` publishes Postgres on all interfaces (`6432:5432`) with the password `dev`.
+### 3. The eval harness measures a path production does not use [from code]
 
-**Suggested fix:** validate the ticker against a pattern like `^[A-Z][A-Z0-9.\-]{0,9}$` at every entry point. Restrict CORS to the UI's origin, or remove it. Add a shared-secret header for the endpoints that spend money. Bind Postgres to `127.0.0.1:6432:5432`.
+`eval/runner.py:136-151` picks exactly one of three modes:
 
-### 5. Financial tables are split away from their headers, and statements land under the wrong section [verified]
-The chunker keeps sections whole but splits long ones into pieces of about 600 tokens. When it does, the table header isn't repeated in the next chunk.
+| flag | method called | decomposition | hybrid |
+|---|---|---|---|
+| `use_hybrid` | `retrieve_hybrid` | no | yes |
+| `use_decomposition` | `retrieve_with_decomposition` | yes | no (vector only) |
+| neither | `retrieve_by_embedding` | no | no |
 
-ACN's FY2025 10-K cash-flow statement is chunk 110, which holds the heading, the column years and the first rows, plus chunk 111, which holds the totals with no header. A model given chunk 111 alone can't tell which column is which year. This is part of why the answer model reported cash-flow rows as "not in the excerpts" on 2026-09-11. The replay showed Luna misreading them even when both chunks were supplied.
+`POST /ask` calls **`retrieve_full`** — decomposition *and* hybrid — and `retrieve_full` is called by nothing in `eval/`. `retrieve_with_decomposition` is called by nothing *but* `eval/runner.py`. So the harness has a method kept alive only for measurement, and the method that serves every agent question is never measured.
 
-The parser also assigns the entire F-pages block to `['Part IV', 'Item 16', 'Form 10-K Summary']`. As a result:
-- Citations read `§Item 16` for financial statements.
-- `section_path_contains=['Item 8']` filtering would miss them.
-- The research agent's "which section is this from" reasoning is wrong for every figure in the statements.
+This matters because the BM25 fix (#84) was justified by a measurement, and the measured configuration is not the shipped one: fusion behaves differently when its inputs are sub-queries.
 
-**Suggested fix:**
-- **Tables:** make chunking table-aware. Keep a table whole when it fits; otherwise repeat the table's title and column-header row at the top of every chunk of it.
-- **F-pages:** detect the financial-statements block (the "Report of Independent Registered Public Accounting Firm" / "Consolidated … Statements" headings) and give it its own section path.
-- **Re-index:** re-chunk the six ACN filings, then compare eval recall before and after.
+The gold sets compound it — they are keyed by serial chunk ids, which change on every re-ingest, `eval/test_set.yaml` is gitignored, and eval is not in CI.
 
-### 6. `calculate` provenance uses the substring matching the verifier already replaced [from code]
-`citation_verifier.py`'s module docstring explains why substring matching was replaced by whole-token matching: a made-up "$420.5M" verified because "$3,420.5" appeared somewhere in the text. `tools.py:950` (`_appears_in_output`, which is check 4 of `validate_calculate_inputs`) still uses `any(v in corpus …)`. So any declared input whose digits appear inside a larger number counts as "retrieved". That covers every two-digit integer, because they appear inside years, and many one-decimal values. The fiscal-period proximity check (check 5) matches the same way.
+**Fix:** add a `full` mode that calls `retrieve_full`, make it the default, and delete `retrieve_with_decomposition` once nothing needs it. Key gold sets by `(accession, section_path, content hash)`.
 
-The codebase has four separate "is this number real" implementations, each with different semantics:
-- `tools._variants` / `_appears_in_output`: plain substring match.
-- `citation_verifier`: whole-token match plus tolerance bands.
-- `debate_port._flag_debate_numbers` / `_is_rounding_of`: exact containment plus a rounding check.
-- `technical_interpreter_port._flag_unmatched_numbers_against`.
+### 4. The forced-memo turn cannot read the prompt cache [from code]
 
-**Suggested fix:** make one shared number-matching module, with the token-anchored matcher as its core. Give each caller a named policy (exact, rounding-tolerant, scale-tolerant) instead of its own implementation, and point the `calculate` checks at it.
+The loop is careful about caching: `_roll_cache_breakpoint` moves a single breakpoint to the last block each turn, and the system block carries its own `cache_control`, so each turn re-reads tools + system + history at ~0.1×.
 
-### 7. Ingestion: FAILED is terminal, and chunking is not idempotent [from code]
-- **FAILED is permanent.** `_advance_filing` exceptions mark the filing FAILED (`ingestion_service.py:97-101`). On the next run, `_upsert_filing` returns the existing row, and none of the status branches match FAILED, so the filing is skipped forever. Nothing in `app/` resets it. The domain model's state machine (`Filing.transition_to()` / `fail()`, which requires going back through DISCOVERED) is never called; `mark_status` writes the status straight to the database. A transient embedding error or 429 therefore permanently removes a filing from the index until someone edits the database.
-- **Chunks can be duplicated.** `_chunk` inserts chunks, commits, and only then marks the filing CHUNKED. It doesn't check for existing chunks (`_parse` does check for existing sections), and `chunks` has no unique constraint on `(section_id, chunk_index)`. A crash between the insert and the status update duplicates the filing's chunks on the next run, and those duplicates then compete in retrieval.
+The final call does neither (`researcher.py:683-690`):
 
-**Suggested fix:**
-- **Failed filings:** add an ingest option (say `--retry-failed`) that moves FAILED back to DISCOVERED through the domain method.
-- **Chunk duplicates:** make `_chunk` delete any existing chunks for the document before inserting, or skip documents that already have them, as `_parse` does. Add a unique index so a duplicate fails loudly.
-- **Per-filing transaction:** insert chunks and update the status in one transaction.
+```python
+response = await client.messages.create(
+    model=AGENT_MODEL,
+    max_tokens=AGENT_MAX_TOKENS,
+    system=system_prompt,      # plain string — no cache_control breakpoint
+    messages=messages,         # no tools=TOOLS
+)
+```
 
-### 8. One non-guard error discards samples that already succeeded; budget checks crash the run [from code]
-- **Only guard errors are dropped.** `synthesizer_node` handles `SynthesisFabricationError` and `SynthesisReferenceError` per sample (`nodes.py:667`). Anything else escapes: a second schema failure (`ValidationError` from `_call_with_schema_retry`), a provider 400 (`LLMBadRequestError`), or a timeout. That discards samples that already passed and were paid for, and the node's cost events go with it. The comment at `nodes.py:679-686` acknowledges the cost loss for the all-dropped case only.
-- **Per-port budget checks crash the run.** The checks in the ports (`_assert_within_budget` in debate, risk, synthesis and news) `raise AssertionError` after the money is spent. That ends the run with a traceback. A run-level breach, by contrast, routes to `graceful_abort` and writes a partial memo. The two budget mechanisms behave differently for what is the same condition from the user's point of view.
+The cached prefix is tools → system → messages, so dropping `tools` invalidates it from the first byte, and with no breakpoint anywhere there is nothing to read from cache regardless. This is the turn that sends the *entire* accumulated conversation, and `tools.py:27-45` records that Phase 9 measured 2 of 3 fundamentals runs ending on exactly this path.
 
-**Suggested fix:** treat any exception in a sample as "dropped", with the reason recorded, and keep its cost events. Have per-port budget breaches raise a dedicated `BudgetExceeded` that the graph converts into the graceful-abort path.
+The `max_tokens` continuation call inside the loop (`researcher.py:604-616`) does keep `cache_control`, and it also omits `tools` — same invalidation, smaller blast radius.
 
-### 9. Tool arguments vs. what the server does with them [from code]
-- **`ingest_ticker` sends `limit: null`.** `_strictify` makes every optional property nullable and required, so a model that doesn't choose a limit sends `limit: null`. `inputs.get("limit", 3)` (`tools.py:573`) returns `None`, not 3, and `IngestRequest.limit: int = 3` then rejects `null` with a 422. `_strictify`'s docstring ("an explicit null behaves exactly as the previously-absent key did") is not true for `.get(key, default)` calls. It works today only because the tool description tells the model to pass `limit=3`.
-- **`extract_metrics`'s date bounds are ignored.** The tool offers `filed_after` / `filed_before` (`tools.py:164-165`) and forwards them (`json=inputs`, `tools.py:624`). `/extract` ignores both and always uses `filed_date ± 30 days` (`main.py:235-236`). The agent is being offered a control that does nothing.
-- **Stale comment.** The comment at `main.py:240` says the decomposer may run during extraction retrieval. `gather_extraction_chunks` uses `retrieve_hybrid`, which never calls it.
+**Fix:** pass `tools=TOOLS` and the structured `system=[{... cache_control ...}]` block on both calls, and call `_roll_cache_breakpoint(messages)` before each. Verify against the `cache_read_ratio` already recorded in each `run_summary` line.
 
-**Suggested fix:** after `_strictify`, read optional arguments as `inputs.get(k) or default`. Either honour the date bounds in `/extract` or remove them from the tool schema.
+### 5. Sub-query results merge by max, not by agreement [from code]
 
-### 10. Resumed runs never write a `run_summary` [from code]
-`invoked` is set to `True` only on the new-run branch (`cli.py:155`), and `log_run_summary` runs only when `invoked` is true (`cli.py:174`). A resumed run that completes, which is exactly the crash-and-resume case the cost reconciliation was designed for, leaves no `run_summary` line. Queries over `kind=run_summary` then undercount runs and spend.
+`retrieve_full` fuses within a sub-query with RRF, then merges across sub-queries with a max (`retrieval_service.py:279-285`, and identically at `:112-116`):
 
-**Suggested fix:** set `invoked = True` on the resume branch too. Mark the summary as a resume so a query can tell the two apart.
+```python
+if existing is None or chunk.similarity > existing.similarity:
+    all_chunks[chunk.chunk.id] = chunk
+```
 
-### 11. Module-level run state is unsafe in the server [from code]
-Several things are per-run module globals:
-- `tools._RETRIEVED_TEXT`, `_CALC_RESULTS`, `_REJECTED_CALC_ATTEMPTS`, `_SESSION_LOG`, `_DELEGATED_USAGE`, `_ASK_EDGAR_CALLS` and `_CALC_CACHE`.
-- `researcher._RUN_STAMP`.
+RRF scores are rank-derived and comparable *within* a ranking, so `max` amounts to "best rank this chunk reached in any sub-query". A chunk that every sub-query ranked 3rd scores the same as one that a single sub-query ranked 3rd and the others missed entirely — the multi-query agreement signal that is the whole reason to decompose is discarded. Summing the per-sub-query RRF contributions is the standard treatment and is a two-line change.
 
-The comment at `tools.py:805` states the assumption: "one agent run per process — true for the CLI". It stops being true in the API server. `/news-assess` and `/trading/analyze` run `run_agent` inside the server process, and any two overlapping requests (or one of them plus the agent's own tool calls back to the same server) share and reset each other's provenance record and `ask_edgar` budget. Wrong provenance defeats the calculate guard and the memo verifier without any error being raised.
+`main.gather_extraction_chunks` (`main.py:373-382`) has the same shape over `METRIC_QUERIES`, and additionally runs its four queries **sequentially**, as does `RetrievalService.retrieve_for_extraction:233-236` — both missed by the #93 parallelisation pass.
 
-**Suggested fix:** move this state into a `RunContext` object that `run_agent` creates and passes through `execute_tool`. Until then, reject overlapping agent runs in the server.
+### 6. The pre-refactor PDF pipeline is still shipped, and a Python 2 `.pyc` is in git [verified]
 
-### 12. Configuration hygiene [verified]
-- **Inconsistent `load_dotenv`.** It's called in 13 places, some with `override=True` (`main.py`, `llm.py`, `checkpointer.py`, the scripts) and some without (`researcher.py`, `cli.py`, `models.py`). So whether a shell variable or `.env` wins depends on which module happens to load first. With `override=True` loaded early, a command-line override of any variable that's also in `.env` is silently ignored. Load it once at each entry point, without override.
-- **Missing variables crash at import.** `LOOP_MAX_TURNS` and `MEMO_DIR` are read with `os.environ[...]` at import time (`researcher.py:42, 58`), so any importer crashes with a bare `KeyError` (the README warns about this). A small settings object, validated at startup, would give one clear error instead.
-- **Settings that do nothing.** This is the trap `models.py`'s docstring describes fixing, recurring:
-  - `EMBEDDING_MODEL` is read only by dead modules (`app/ingest.py`, `app/retrieve.py`). `EmbeddingService` hard-codes `text-embedding-3-small` (`embedding_service.py:10`).
-  - `OPENAI_MODEL` is read by nothing.
-  - `scripts/run_p9_battery.py` records both in every battery manifest, so the reproducibility record carries two settings that had no effect.
-- **Redundant branch.** `model_for` has an `if` whose branches return the same expression (`models.py:84-86`).
-- **Wrong checklist size.** `.env.example` sizes `LOOP_MAX_TURNS` for a "7-item checklist"; the analyst prompt defines 12 items.
+`app/ingest.py`, `app/retrieve.py`, `app/db_postgres.py`, `app/db.py` and `app/chunk.py` are the original tutorial pipeline. Nothing at runtime imports them — `tests/test_config.py:25` already lists two of them as `_DEAD_MODULES` so the "only `app/config.py` loads dotenv" guard can pass, which is the tell: **the dead modules are the only reason that exemption exists**. Both still call `load_dotenv(override=True)` at import, the exact pattern `app/config.py` was written to eliminate. `app/ingest.py` writes to a `chunks(source, chunk_index, …)` schema that no longer exists.
 
-### 13. Wall clock is the binding constraint, and independent work runs one call at a time [from code]
-Full runs take 350–920 s against an 1800 s deadline (cost has ample headroom; time does not). Four places run independent work one call at a time:
-- **Agent tool calls.** `run_agent` awaits each tool call in turn (`researcher.py:529-538`). On 2026-09-11 Luna issued 6–7 `ask_edgar` calls per turn, and each one blocks the next.
-- **Synthesizer samples.** The three samples, including two extra 9-turn risk panels, are independent but run in sequence (`nodes.py:650`).
-- **Sub-query retrieval.** `retrieve_full` and `retrieve_with_decomposition` retrieve sub-queries one after another.
-- **Per-request clients.** Every request builds a new `EmbeddingService`, new `QueryDecomposer` and new provider clients, so no HTTP connection pool is reused.
+`app/__init__.pyc` is tracked (`git ls-files | grep pyc`), 102 bytes, magic `03f3 0d0a` — CPython **2.7** bytecode. `.gitignore` has `__pycache__/` but no `*.pyc`.
 
-**Suggested fix:** use `asyncio.gather` for tool calls in the same turn. The provenance record is append-only, so record results in the model's order after the gather. Also gather the synthesizer samples, and the sub-query retrievals. Build clients once, at app startup. Parallel samples would take effect only after #2's per-sample budget check, otherwise three concurrent panels could overshoot together.
+Deleting the five modules also removes the last reader of `EMBEDDING_MODEL` outside `EmbeddingService`, and lets `_DEAD_MODULES` come out of `test_config.py`.
+
+### 7. Seven env reads bypass `require_env` [verified]
+
+`app/config.py` exists to turn a missing setting into a message naming `.env.example`. Seven reads still raise a bare `KeyError` or produce a confusing downstream failure:
+
+| file:line | variable | failure |
+|---|---|---|
+| `main.py:410`, `main.py:440` | `EDGAR_USER_AGENT` | `KeyError` → HTTP 500 |
+| `cli.py:169`, `cli.py:361` | `EDGAR_USER_AGENT` | `KeyError` traceback |
+| `repositories/db.py:13` | `POSTGRES_DATABASE_URL` | `KeyError` |
+| `db_postgres.py:8` | `POSTGRES_DATABASE_URL` | `KeyError` at import (dead module — see #6) |
+| `checkpointer.py:22` | `TRADING_CHECKPOINT_DB_URI` | `os.getenv` → `None` → `AsyncConnectionPool(conninfo=None)` |
+
+`AGENT_TOOL_CONCURRENCY` is read by the code and documented nowhere — it is the only variable missing from `.env.example` (the env cross-check found no others; the "documented but unread" names are all resolved dynamically through `models.ROLES`).
+
+### 8. The cost log: two hardcoded paths, no rotation [from code]
+
+`Path("docs/cost-log.jsonl")` is written literally in two places — `researcher.log_cost:390` and `cost_log._COST_LOG_PATH:29` — with no shared constant and no env override. Both are relative to the process working directory, so a run started anywhere but the repo root silently creates a new `docs/` there and writes a log nothing reconciles against.
+
+The file is append-only and unbounded: 3,177 lines / 1.0 MB today. `_disk_logged_events` reads and JSON-parses the whole file once per run summary, filtering by `run_id`.
+
+**Fix:** one `COST_LOG_PATH` constant resolved from the repo root (or `COST_LOG_PATH` env), imported by both. Rotate by month (`cost-log-2026-09.jsonl`) and have the reconciliation read only the current file plus the previous one.
+
+### 9. Six helpers copied verbatim across three ports [verified]
+
+`_accumulate` is byte-identical in `debate_port.py:1219`, `risk_port.py:418` and `synthesis_port.py:691`. Alongside it each port carries its own `_tool_block`, `_extract`, `_CORRECTION`, `_retry_messages` and `_assert_within_budget`, plus `_maybe_crash` with its own `_CRASH_AT`/`_CRASH_WHEN` pair. `news_digest_port` has a fourth `_assert_within_budget`.
+
+The three ports are 1,581 + 766 + 1,002 lines. A shared "forced tool call with one schema retry, cost accounting, a crash hook and a spend ceiling" helper would remove a few hundred lines, and — more valuable — would give the four budget ceilings one implementation to fix rather than four to keep in step.
+
+### 10. `use_hybrid` is a knob connected to nothing [verified]
+
+`RetrievalService.__init__` stores `self.use_hybrid` (`:41`) and no method ever reads it. Callers choose hybrid by *calling* `retrieve_hybrid`/`retrieve_full` directly. The parameter is nonetheless passed from `main.py:262`, `main.py:335`, `cli.py:402`, `eval/runner.py:130` and one test — and in `eval/runner.py` the same flag *does* steer behaviour via an `if`, so the two meanings sit one frame apart.
+
+This is the precise trap `models.py`'s docstring describes ("two variables that no code read at all — so changing them looked like it worked and did nothing"), recurring as a constructor argument.
+
+### 11. Three small failures that read as success [from code]
+
+- **Silent price fetches.** `_try_yfinance:124` and `_try_finnhub:156` catch bare `Exception` and `return None`, with no logging. A rate limit, an auth failure and "this ticker has no data" are indistinguishable — and the fallback chain means a broken primary vendor looks like a normal secondary hit.
+- **Unguarded `content[0]`.** `llm.py:69` and `query_decomposer.py:160` read `resp.content[0].text` with no length check. The OpenAI-compat adapter returns no content blocks when the provider sends no text (output cut at the token limit is the common case), which surfaces as `IndexError` → HTTP 500 from `/ask`.
+- **`researcher --test` crashes.** `main()` sets `mode` on the `--news` and ticker branches only; the `--test` branch leaves it unbound, and line 748 reads `if mode != "test"`. `python -m app.agent.researcher --test` raises `UnboundLocalError` after the run completes. The docstring advertises the flag at the top of the file.
 
 ---
 
 ## Low
 
-**Dead or stale code**
-- `app/db.py`, `app/ingest.py`, `app/retrieve.py` and `app/db_postgres.py` are the pre-refactor PDF pipeline. `app/ingest.py` writes to a `chunks(source, …)` schema that no longer exists. `app/chunk.py` is imported only by these and by an unused import in `app/llm.py`.
-- **`app/__init__.pyc` is committed**, and it's Python 2.7 bytecode (magic `03f3 0d0a`). Delete it and add `*.pyc` to `.gitignore`.
-- **Unused or leftover code:**
-  - `FinancialMetricsResponse` (`main.py:105`).
-  - A duplicate `format_citation_tag` import (`main.py:18, 25`).
-  - `USE_STUBS` and the "STEP 2" scaffolding comments in `tools.py`.
-  - `MetricsRepository(session_factory=None)`, whose parameter is unused.
-  - `from sqlite3 import connect` (`edgar/client.py:6`).
-  - `Filing.transition_to` / `fail`, never called (see #7).
+**Dead code and leftovers** (all verified by an AST pass; `from __future__ import annotations` false positives excluded)
 
-**Duplication across the ports**
-- `_accumulate` is byte-identical in `debate_port`, `risk_port` and `synthesis_port`.
-- Each port also has its own `_tool_block`, `_extract`, `_CORRECTION`, `_retry_messages`, `_submit`, `_maybe_crash` and `_assert_within_budget`.
-- A shared "forced tool call with one schema retry, cost accounting and a crash hook" helper would remove a few hundred lines. It would also make #8's handling consistent in one place.
+- `app/agent/trading/interface/cli.py:20` imports `RECURSION_LIMIT`, `_describe_stale_budget` and `_humanize` from `runner` and uses none of them — leftovers from the #82 extraction.
+- `runner._describe_stale_budget` takes `wall_clock_timeout_s` and never uses it.
+- `main.py:164` `FinancialMetricsResponse` — referenced nowhere.
+- `main.py:36` and `main.py:43` both import `format_citation_tag`.
+- `metrics_repo.py:6` `from sqlalchemy.dialects.postgresql import insert` — unused, and the only SQLAlchemy import in the repository layer.
+- `metrics_repo.py:5` imports `FinancialMetrics` and line 11 shadows it (see #1).
+- `edgar/client.py:6` `from sqlite3 import connect`; `edgar/ticker_resolver.py:3` `date`; `app/llm.py:5` `Chunk, Chunks`; `app/domain/chunk.py:2` `Field`; `section_repo.py:1` `Json`; `app/cli.py:8` `asdict`; `debate_port.py:47` `create_with_temperature_fallback`; `risk_port.py:38` `RISK_MAX_TURNS`; `eval/runner.py:9,14` `MetricsExtractor`, `init_pool`, `close_pool`.
+- `tools.py:487` `USE_STUBS = False`, `_stub()`, and the "STEP 2 / Un-stub by setting…" comments describe a wiring step finished long ago.
+- `MetricsRepository(session_factory=None)` — the parameter is stored and never read, and every call site passes `None`.
+- `Filing.transition_to` / `fail` are now called (ingestion retry, #89), so that item is closed.
+- A stale git worktree sits at `.claude/worktrees/inspiring-kilby-ec9f13` (detached at `c35b498`, last touched 2026-08-29) with a full duplicate of `app/` and `tests/`. It distorts any repo-wide grep.
 
-**Small bugs**
-- **`--test` crash.** `python -m app.agent.researcher --test` crashes after the run: `mode` is never assigned on the test path (`researcher.py:637`).
-- **Unguarded `content[0]`.** `resp.content[0].text` is read without a check (`llm.py:72`, `query_decomposer.py:160`). The OpenAI adapter returns no content blocks when the provider sends no text, for example when output is cut off at the token limit. That raises `IndexError`, a 500 from `/ask`.
-- **Silent price-fetch failures.** `price_data_port` swallows all yfinance and Finnhub exceptions without logging (`:124, :156`), so a rate limit looks the same as "no data".
-- **Deprecated event-loop call.** `asyncio.get_event_loop()` inside a coroutine (`edgar/client.py:94, 97`); use `get_running_loop()`.
-- **Truncated filing history.** `list_filings` reads only the `filings.recent` part of EDGAR's filing list and ignores older history in `filings.files`, so older filings are silently missing when `since` goes far back.
+**Small correctness notes**
 
-**Correctness risks worth a note**
-- **`calculate` returns a bare number with no unit.** Inputs are normalised to ones, so a difference of two thousands-denominated figures comes back 1000× larger than the source table's scale, with nothing saying so. That leaves the memo one misreading away from a 1000× error. Return the unit with the number, or normalise to the smallest declared scale.
-- **`chunk_repo.search_by_embedding`'s docstring is inaccurate.** It says the filters run as a bitmap index scan before the HNSW scan, but pgvector doesn't combine indexes that way. With a selective filter it either sorts the filtered rows exactly or filters after the approximate scan, and the second can return fewer than `k` rows as the index grows. Consider `hnsw.iterative_scan` (pgvector ≥ 0.8), or exact search when a ticker filter is present.
+- `calculate` returns a bare number. `_scale_by_value` normalises declared inputs to ones, so a difference of two thousands-denominated figures comes back 1000× the source table's scale with nothing saying so. `_scale_by_value` also keys by float value, so two inputs sharing a value but not a unit silently collide.
+- `chunk_repo.search_by_embedding`'s docstring still claims filters "execute as a Bitmap Index Scan BEFORE the HNSW similarity scan". pgvector does not combine indexes that way; with a selective filter it either sorts the filtered rows exactly or filters after the approximate scan, and the second can return fewer than `k` rows as the index grows. Consider `hnsw.iterative_scan` (pgvector ≥ 0.8) or exact search when a ticker filter is present.
+- `edgar/client.py:94,97` calls `asyncio.get_event_loop()` inside a coroutine; use `get_running_loop()`.
+- `list_filings` reads only `filings.recent` and ignores `filings.files`, so prolific filers are silently truncated (the README names this; the code does not).
+- `memo_verifier._appended` emits `["", "---"] + verdict_lines` while the report path emits `["", "---", ""] + verdict_lines` — one extra blank line, two spellings of the same separator.
+- `_sample_additional_risk_panel` runs a full 9-turn panel with no budget check between turns; the run-level check happens only *before* each sample. The port's own `NodeBudgetExceeded` is the only thing bounding a runaway inside one sample.
+- `tools.py:24` `API_BASE = "http://localhost:8000"` is a module constant with no env override, and every tool call constructs a fresh `httpx.AsyncClient` (`tools.py:601`) — no connection reuse, which #93 fixed everywhere else.
 
-**Dependencies and eval**
-- **Undeclared dependencies.** `pyyaml` (in `researcher.py` and `eval/`) and `pandas` are imported directly but installed only as dependencies of other packages (`uvicorn[standard]`/`langchain-core`, and yfinance). Declare them.
-- **Fragile eval gold sets.** They're keyed by serial chunk IDs, which change on every re-ingest; the test set is gitignored, and eval isn't in CI. Keying gold sets by `(accession, section_path, text hash)` would survive re-ingestion.
+**Dependencies**
+
+- `pyyaml` is imported by `researcher.py`, `eval/runner.py` and `eval/extract_runner.py`; `pandas` by `technical_indicators.py` and `price_data_port.py`. Neither is declared in `pyproject.toml` — both arrive transitively (`uvicorn[standard]`, `yfinance`). A transitive bump can remove either.
 
 **Documentation**
-- **Diverging duplicates.** `architecture.md` exists at the root (644 lines) and in `docs/` (711 lines), and the two differ. `trading-agent-known-gaps.md` and `watchlist.yaml` are also duplicated, as byte-identical copies, pending #81.
-- **Typos in the `/ask` prompt.** The system prompt in `app/llm.py` has several ("the enough", "generate knowledge", "premable", an unclosed quote). They're harmless, but it's the prompt behind every `/ask`.
 
----
+- `architecture.md` exists at the repo root (644 lines) and in `docs/` (711 lines), and the two have **diverged**. `trading-agent-known-gaps.md` and `watchlist.yaml` are byte-identical duplicates in both places — and `researcher.WATCHLIST_PATH` reads the **root** copy, so `docs/watchlist.yaml` is a decoy that can drift without anything noticing.
+- The README's "Known limitations" still says *"The budget is checked on edges, not inside nodes… the documented 'overshoot by at most one call' bound is wrong for the most expensive node"*. PR #83 fixed that; the entry is now false.
+- README test counts are stale: "612 test functions (702 cases after parametrization)" vs. 881 passing today.
+- `app/llm.py`'s `SYSTEM_PROMPT`, behind every `/ask`, contains "the enough information", "fall back on generate knowledge", "No premable", and an unclosed quote at `- Be concise, No premable. no "Based on the provided context,`.
+- `docs/tutorial.md` is mode `600` where every other tracked file is `644`.
 
-## Testing
+**CI and tooling**
 
-**Strengths:**
-- Wide unit coverage of the guards, routers, reducers, checkpoint round-trips (against real Postgres in CI), provider translation and cost accounting.
-- Tests are named after the incident they pin, which makes intent obvious.
-
-**Gaps:** each of these would have caught a finding above.
-- **No HTTP endpoint tests.** A FastAPI `TestClient` smoke test of `/trading/analyze` with stubbed ports would have caught #1, and one of `/ingest` with `limit: null` would have caught #9.
-- **No SQL-level retrieval tests.** Nothing tests `search_by_text` or hybrid fusion against the database. A single "BM25 returns at least one hit for a query copied from a chunk" test would have caught #3.
-- **No ingestion tests** for idempotency (re-running after a partial chunk insert) or for retrying a FAILED filing (#7).
-- **No chunker test on a table larger than one chunk** (#5).
-- **Resume path.** The CLI test for resuming doesn't check that a `run_summary` gets written (#10).
-- **A test that depends on a local file.** `test_manifest_merge.py:80` reads `docs/validation/…` and skips when the file is absent, which it currently is in this working tree.
+- The workflow runs `pytest` only. No linter, no formatter, no type checker — every unused import in #12 would have been caught for free by `ruff check`.
+- No CLI command has a test (`app/cli.py` and `app/agent/trading/interface/cli.py` between them are 709 lines). #1 is the direct consequence.
+- `tests/agent/trading/test_manifest_merge.py:82` skips on a `docs/validation/` file that is gitignored, so it skips in CI too and reads as passing.
 
 ---
 
 ## Suggested order of work
 
-1. **Close the exposure (#1, #4).** Fix `/trading/analyze` or remove it. Validate the ticker, tighten CORS, and bind Postgres to localhost. This is small and removes the only paths where money can be spent from outside the machine.
-2. **Make the budget guard reach inside nodes (#2, #8, #10).** This is the property the cost tracking exists to provide.
-3. **Fix retrieval quality (#3, #5).** Fix the BM25 query, make chunking table-aware, and fix the F-pages section label. Measure with `eval/` before and after. This is likely the largest quality lever for the fundamentals gaps seen on 2026-09-11.
-4. **Make ingestion robust (#7).**
-5. **Consolidate number matching and the port boilerplate (#6, Low/duplication).**
-6. **Clean up config and dead code (#12, Low).**
-7. **Parallelise (#13)** once #2 is in, since parallel samples make the in-node budget checks more important.
+1. **Fix what is broken (#1, #11).** `extract-metrics`, `researcher --test`, the two `content[0]` reads. Small, self-contained, each with a test.
+2. **Close the lookahead hole (#2).** This is the one finding that changes what the product's output *means*.
+3. **Make the measurements describe production (#3, #4, #5).** Eval on `retrieve_full` first, because #4 and #5 both want before/after numbers.
+4. **Delete what is dead (#6, #10, #12).** Largest reduction in reading surface per unit of risk, and it unblocks the `_DEAD_MODULES` exemption in `test_config.py`.
+5. **Consolidate (#7, #8, #9).** `require_env` everywhere, one cost-log path, one structured-call helper.
+6. **Add the tooling that would have found half of this (#14).**
 
 ---
 
@@ -250,48 +260,125 @@ Full runs take 350–920 s against an 1800 s deadline (cost has ample headroom; 
 
 `[x]` = done and tested, `[~]` = in progress, `[ ]` = not started. Each High item ships as its own PR.
 
+**Status, 2026-09-12:** every High and Medium item is addressed across PRs #102–#107, which stack in that order (#102 → #103 → #104 → #105 → #106 → #107). Suite at the tip: 951 passed, 1 skipped. Six sub-items are left open and each says below why — all six need either the gitignored eval corpus or a live paid run.
+
 ### High
-**#1 `/trading/analyze`**: PR #82, merged
-- [x] One shared "start or resume a run" function for both the CLI and the API: builds the initial state (`ticker`, `as_of_date`, `run_id`, `budget`), refuses a stale resume, and sets `recursion_limit`
-- [x] Request accepts `as_of_date` (defaults to today at the boundary, as in the CLI), `max_usd` and `wall_clock_timeout_s`
-- [x] Artifacts saved inside `vault_run()`, so one run gets one vault folder
-- [x] An aborted run returns its termination reason instead of a `KeyError`
-- [x] Endpoint tests using FastAPI `TestClient` with a stubbed graph
-- [ ] Follow-up (not in this PR): run in the background and return a job id
 
-**#2 Budget and deadline inside nodes**: PR #83, merged
-- [x] `run_agent` accepts a stop check: evaluated before every model turn and every tool call; when it fires, the loop ends the way `MAX_TURNS` does, so the agent still writes a memo
-- [x] Fundamentals port builds that check from the run budget, earlier spend, the agent's own usage and delegated usage (each priced at its own model's rate)
-- [x] `synthesizer_node` checks the budget before each extra verdict sample; a skipped sample is recorded as a data gap
-- [x] `guards.py` docstring corrected
-- [x] Unit tests: the agent stops mid-loop, synthesis skips samples on a breach
-- [x] Live test, ACN with `--max-usd 0.03`: the loop stopped at $0.0304, refused 7 `ask_edgar` calls, wrote its memo, and the run ended `budget_exceeded` at $0.0377. The overshoot is the one forced memo call.
+**#1 `extract-metrics` crashes**: PR #102
+- [x] Rename the repository dataclass to `FinancialMetricsRow` and delete the shadowed `from app.application.extraction_service import FinancialMetrics` in `metrics_repo.py`
+- [x] One shared `build_metrics_row(extracted, ticker, fiscal_period, filing_type, filed_date, chunks)` used by both `main.extract` and `cli._run_extract_metrics`
+- [x] `_run_extract_metrics` opens and closes the pool like every other CLI coroutine
+- [x] Test: `extract-metrics` end to end against stubbed extractor and repository, asserting the row's `ticker`/`fiscal_period`/`source_citations`
+- [x] Test: at least one smoke test per `app.cli` command, so no shipped command is untested again
 
-**#3 BM25 half of hybrid retrieval**: PR #84, merged
-- [x] `search_by_text` matches ANY term (OR), while keeping `plainto_tsquery`'s stemming and escaping
-- [x] Cosine similarity kept alongside the fused RRF score, and shown to the agent as `sim=` instead of the RRF value
-- [x] Unit test for the query shape and for RRF preserving the vector similarity
-- [x] Measured against the local corpus before and after (SQL only, no LLM spend). Result: queries with zero keyword hits went from 51/51 to 0/51. Answering chunks in the fused top 8: cash-flow questions 37 → 42, internal-control questions 6 → 11. Distinct-term and IDF rankings were measured too and did no better, so the simplest one shipped.
-- [ ] Follow-up: `ask_edgar` can't pass a filing-type or date filter, so a question about "the FY2025 10-K" also retrieves 10-Qs and other years
-
-All three High PRs merged together pass 750 tests (1 skipped).
+**#2 `as_of_date` does not reach the fundamentals leg**: PR #103
+- [x] `get_fundamentals_report(ticker, as_of, ...)` — required, not defaulted
+- [x] `fundamentals_node` passes `state["as_of_date"]`; the port raises if it is missing, as `news_node`/`synthesizer_node` do
+- [x] The task prompt states the analysis date; `FundamentalsReport.generated_at` is set from it, not `date.today()`
+- [x] Fundamentals cache keyed on `(ticker, as_of)`; writes gated on `MOCK_FUNDAMENTALS` or moved under `MEMO_DIR`
+- [x] Until retrieval can be bounded by filing date, the port emits an explicit data gap naming the fundamentals leg as not point-in-time
+- [x] Test: a run with `as_of` in the past reaches the port with that date and never calls `date.today()`
+- [x] Update the README's "Known limitations" entry to match what ships
 
 ### Medium
-- [ ] #4 Validate the ticker at every entry point; restrict CORS; shared-secret header on endpoints that spend money; bind Postgres to 127.0.0.1
-- [ ] #5 Table-aware chunking (repeat table title and header row); give the F-pages block its own section; re-chunk ACN; compare eval results
-- [ ] #6 One shared number-matching module (token-anchored); point the `calculate` checks at it
-- [ ] #7 `--retry-failed` through the domain state machine; idempotent `_chunk`; unique index on `(section_id, chunk_index)`; one transaction per filing
-- [ ] #8 Drop a synthesis sample on any exception and keep its cost; per-port budget breach becomes a graceful abort
-- [ ] #9 Read optional tool arguments as `inputs.get(k) or default`; honour or remove the `extract_metrics` date bounds; fix the stale comment
-- [ ] #10 Write a `run_summary` for resumed runs
-- [ ] #11 `RunContext` object instead of module globals; reject overlapping agent runs in the server until then
-- [ ] #12 One `load_dotenv` per entry point; settings validated at startup; wire or remove `EMBEDDING_MODEL`/`OPENAI_MODEL`; fix `model_for` and the "7-item" note
-- [ ] #13 Gather same-turn tool calls, synthesis samples and sub-query retrievals; build clients once at startup
+
+**#3 Eval measures the production path**: PR #104
+- [x] `eval/runner.py` gains a `full` mode calling `retrieve_full`; make it the default
+- [ ] Re-run the 51-query BM25 comparison under `full` and record the numbers beside the #84 ones — **not done:** needs the gitignored `eval/test_set.yaml` and spends decomposer calls per question
+- [x] Delete `retrieve_with_decomposition` once nothing calls it
+- [ ] Key gold sets by `(accession, section_path, content hash)` instead of serial chunk id — **not done:** the test set is gitignored and absent from this checkout, so the migration cannot be written against real data
+- [ ] Commit a small `eval/test_set.yaml` (or a fixture subset) so eval can run in CI — **not done:** same reason. The harness itself is now unit-tested (`tests/test_retrieval_fusion.py`), which is what CI can run without a corpus
+
+**#4 Forced-memo turn misses the prompt cache**: PR #105
+- [x] Final forced-memo call sends `tools=TOOLS` and the structured `system` block with `cache_control`
+- [x] `_roll_cache_breakpoint(messages)` before the forced-memo call and before the `max_tokens` continuation call
+- [x] Continuation call also sends `tools=TOOLS`
+- [x] Test: both calls carry a `cache_control` breakpoint and the tool list
+- [ ] Confirm on one live run that `cache_read_ratio` in the `run_summary` line improves — **not done:** costs a real run; the mechanism is pinned by test instead
+
+**#5 Cross-sub-query merge**: PR #104
+- [x] `retrieve_full` sums each chunk's per-sub-query RRF contributions instead of taking the max
+- [x] ~~Same in `retrieve_with_decomposition` if it survives #3~~ — it did not survive; deleted in #104
+- [x] `gather_extraction_chunks` and `retrieve_for_extraction` run their fixed queries with `asyncio.gather`
+- [ ] Measure with the #3 harness before and after — **not done:** same corpus/spend constraint as #3's re-run
+
+**#6 Delete the dead PDF pipeline**: PR #106
+- [x] Delete `app/ingest.py`, `app/retrieve.py`, `app/db_postgres.py`, `app/db.py`, `app/chunk.py`
+- [x] `git rm --cached app/__init__.pyc`; add `*.pyc` to `.gitignore`
+- [x] Remove `_DEAD_MODULES` from `tests/test_config.py` — the dotenv guard then covers all of `app/`
+- [x] Drop the now-unused `Chunk`/`Chunks` import from `app/llm.py`
+- [x] Remove the stale `.claude/worktrees/inspiring-kilby-ec9f13` worktree (`git worktree remove`)
+
+**#7 One way to read a required setting**: PR #106
+- [x] `require_env` at `main.py:410,440`, `cli.py:169,361`, `repositories/db.py:13`, `checkpointer.py:22`
+- [x] Document `AGENT_TOOL_CONCURRENCY` in `.env.example`
+- [x] Test: every `os.environ[...]` in `app/` is gone, in the style of `test_only_app_config_loads_dotenv`
+
+**#8 Cost log**: PR #106
+- [x] One `COST_LOG_PATH`, resolved from the repo root and overridable by env, imported by `researcher.log_cost` and `cost_log.py`
+- [x] Monthly rotation; `_disk_logged_events` reads the current file plus the previous one
+- [x] Test: a process started from another working directory writes to the same file
+
+**#9 Shared structured-call helper**: PR #107
+- [x] One module owning `_accumulate`, `_tool_block`, `_extract`, `_CORRECTION`, `_retry_messages`, `_maybe_crash` and the spend ceiling
+- [x] debate, risk, synthesis and news ports call it; per-port constants stay per-port
+- [x] The four `_assert_within_budget` variants become one, raising `NodeBudgetExceeded` as they do now
+- [x] Existing port tests pass unchanged — this is a refactor, not a behaviour change
+
+**#10 Remove the `use_hybrid` knob**: PR #104
+- [x] Drop the parameter from `RetrievalService.__init__` and from `main.py:262,335`, `cli.py:402`, the test
+- [x] `eval/runner.py` keeps its own mode flag under a name that says it is the harness's (`mode=`), not the service's
+
+**#11 Failures that read as success**: PR #105
+- [x] `_try_yfinance` / `_try_finnhub` log the exception (vendor, ticker, `as_of`, exception type) before returning `None`
+- [x] Guard `resp.content` in `llm.py:69` and `query_decomposer.py:160`; return a clear error, not `IndexError`
+- [x] `researcher.main()` sets `mode = "test"` on the `--test` branch; test it
+- [x] Test: an empty-content provider response from `/ask` returns an explicit "the model returned no answer" body rather than a traceback. **Deviation:** a 200 with a plain answer, not a 4xx/5xx — the research agent treats a non-200 as a tool error and retries, which would spend a second call on a question the provider has already declined to answer
 
 ### Low
-- [ ] Delete the dead PDF-pipeline modules, `app/__init__.pyc` (add `*.pyc` to `.gitignore`) and unused symbols
-- [ ] Shared structured-call helper for the debate, risk and synthesis ports
-- [ ] `researcher --test` crash; guard `content[0]`; log the price-fetch exceptions; `get_running_loop`; read EDGAR's `filings.files`
-- [ ] `calculate` returns a unit; fix the pgvector filtering docstring and consider `hnsw.iterative_scan`
-- [ ] Declare `pyyaml`/`pandas`; key eval gold sets by content instead of chunk id
-- [ ] Merge the duplicate docs; fix the prompt typos
+- [ ] Remove the unused imports and symbols listed under #12, including the duplicate `format_citation_tag` in `main.py` and `FinancialMetricsResponse`
+- [ ] Delete `USE_STUBS`, `_stub()` and the "STEP 2" comments from `tools.py`; drop the unused `session_factory` from `MetricsRepository`; drop the unused `wall_clock_timeout_s` from `_describe_stale_budget`
+- [ ] `calculate` returns its unit alongside the number; `_scale_by_value` keys on `(value, unit)` so same-valued inputs cannot collide
+- [ ] Correct the `search_by_embedding` filtering docstring; evaluate `hnsw.iterative_scan` or exact search under a ticker filter
+- [ ] `get_running_loop()` in `edgar/client.py`; read `filings.files` so prolific filers are not truncated
+- [ ] `API_BASE` reads an env var; build one `httpx.AsyncClient` per agent run instead of one per tool call
+- [ ] Add a budget check between turns inside `_sample_additional_risk_panel`
+- [ ] Declare `pyyaml` and `pandas` in `pyproject.toml`
+- [ ] Merge the duplicate docs: one `architecture.md`, one `trading-agent-known-gaps.md`, one `watchlist.yaml` (keep the root copy the code reads, or move the path into config and keep the `docs/` copy)
+- [ ] Refresh the README: drop the fixed "budget is checked on edges" limitation, update the test counts
+- [ ] Fix the `/ask` system-prompt typos in `app/llm.py`; `chmod 644 docs/tutorial.md`
+- [ ] Normalise `memo_verifier`'s two separator spellings
+
+### CI and tooling
+- [ ] Add `ruff check` (and `ruff format --check`) to `.github/workflows/tests.yml`; fix what it finds
+- [ ] Add a type checker in non-blocking mode first, then tighten — #1 is a type error a checker would have caught
+- [ ] Commit the `docs/validation/` fixture `test_manifest_merge.py` needs, or rewrite it against a temp file, so nothing skips in CI
+- [ ] Run `eval/` in CI against the committed test set once #3 lands
+
+---
+
+## What this pass shipped
+
+PRs #102–#107, stacking in that order. Each is reviewable on its own top commit.
+
+| PR | Findings | Substance |
+|---|---|---|
+| #102 | High #1 | `extract-metrics` called five things that do not exist; the row type is renamed and built through one constructor. A migration adds the `reasoning` column all three read methods already selected. |
+| #103 | High #2 | `as_of` reaches the fundamentals leg and is enforced in the TOOLS — `filed_before` on every filing-reading call — not in the prompt. |
+| #104 | Medium #3, #5, #10 | The eval harness measures `retrieve_full`; sub-queries fuse by summing; `use_hybrid` removed. |
+| #105 | Medium #4, #11 | One request shape per turn, so the forced-memo call can hit the prefix cache; three silent failures now say something. |
+| #106 | Medium #6, #7, #8 | Dead PDF pipeline and a Python 2 `.pyc` deleted; `require_env` everywhere; one cost-log path, rotated monthly. |
+| #107 | Medium #9 | 250 lines out of three ports into one `structured_call` module. |
+
+Two findings grew in scope once opened, and both are worth knowing about:
+
+- **#1 was five bugs, not one.** `FilingStatus.INGESTED`, `list_by_state`, `set_state` and `Filing.fiscal_period` do not exist either. The command had never run. The repository's three read methods were also selecting a `reasoning` column the table never had.
+- **#4 is worse than it reads on Anthropic.** The providers this project runs on do automatic *prefix* caching and `cache_control` is stripped in translation, so dropping `tools` from the forced-memo call did not merely lose a breakpoint — it made a cache hit impossible.
+
+## What the previous review left open
+
+For the record, and because these are now folded into the checklist above rather than tracked separately:
+
+- Previous **High #1–#3** and **Medium #4–#13**: all shipped (PRs #82–#95). Spot-checked this review — CORS is scoped, `APP_API_KEY` guards the spending endpoints, ticker validation reaches the vault writer, Postgres binds to `127.0.0.1:6432`, the BM25 query ORs its terms, per-run state lives in ContextVars, `_chunk` is idempotent under a unique index, and `check_run_guards` is called from inside both expensive nodes.
+- Previous **Low**: every item still open. They appear above as #6, #9, #11, #12 and the Low section.
+- Previous **follow-ups left open** and still open: re-chunk and re-embed the corpus so the #94 table-aware chunking takes effect on already-ingested filings; run the synthesizer's verdict samples concurrently; give `ask_edgar` a filing-type and date filter; run `/trading/analyze` in the background behind a job id.

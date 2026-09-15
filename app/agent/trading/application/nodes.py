@@ -7,6 +7,7 @@ resolution live in infrastructure/synthesis_port.py — this module still owns
 the caveat computation (`_news_caveats`, `_debate_caveats`, `_risk_caveats`),
 same split as the risk/debate ports vs. their nodes.
 """
+import logging
 from collections import Counter
 from datetime import date, datetime, timezone
 
@@ -18,7 +19,9 @@ from app.agent.trading.application.risk_ledger import (
     unexpected_missing_scores,
 )
 from app.agent.trading.application.risk_router import RISK_MAX_TURNS
+from app.agent.trading.domain.budget import NodeBudgetExceeded, RunTermination
 from app.agent.trading.domain.decision_memo import Verdict
+from app.agent.trading.domain.errors import VendorError
 from app.agent.trading.domain.news_digest import (
     AGGREGATED_RELEVANCE,
     NewsDigest,
@@ -57,6 +60,8 @@ from app.agent.trading.infrastructure.technical_interpreter_port import interpre
 # sampling has to re-run the whole (panel, Research Manager, Risk Judge)
 # trial, not just resample the Judge's call. See
 # trading-agent-known-gaps.md for the measurements this decision rests on.
+logger = logging.getLogger(__name__)
+
 RISK_VERDICT_SAMPLES = 3
 
 
@@ -75,8 +80,12 @@ async def graceful_abort_node(state: TradingState) -> dict:
     debate_terminated_by/risk_terminated_by, one level up.
     """
     events = state.get("cost_events") or []
-    budget = state["budget"]
-    terminated_by = check_run_guards(events, budget, datetime.now(timezone.utc))
+    if state.get("node_budget_breach"):
+        # A port's own cap tripped (graph.py's _contain_node_budget) — the
+        # run-level budget may well be intact, so it is not re-derived here.
+        terminated_by = RunTermination.NODE_BUDGET_EXCEEDED
+    else:
+        terminated_by = check_run_guards(events, state["budget"], datetime.now(timezone.utc))
     if terminated_by is None:
         # Only reachable if a guard edge routed here without the guard
         # actually tripping — a wiring bug, named here rather than silently
@@ -92,11 +101,24 @@ async def graceful_abort_node(state: TradingState) -> dict:
 
 
 async def fundamentals_node(state: TradingState) -> dict:
-    print(f"[fundamentals] running for {state['ticker']}")
+    as_of = state.get("as_of_date")
+    if as_of is None:
+        # Same rule as technical_node and news_node, and the last leg to
+        # adopt it. This node used to call date.today() inside the port and
+        # never see the run's analysis date at all, so a historical run
+        # bounded its prices and news and let its most heavily-weighted
+        # analyst read whatever had been filed since.
+        raise ValueError(
+            "as_of_date missing from TradingState — refusing to run the "
+            "fundamentals agent unbounded. Filing retrieval without an "
+            "explicit upper bound is a lookahead bug."
+        )
+    print(f"[fundamentals] running for {state['ticker']} as of {as_of}")
     # The budget and the run's earlier spend go in so the agent loop can stop
     # itself: the edge guard around this node cannot see inside it.
     report = await get_fundamentals_report(
         state["ticker"],
+        as_of,
         run_id=state.get("run_id"),
         budget=state.get("budget"),
         prior_events=state.get("cost_events") or [],
@@ -128,7 +150,23 @@ async def technical_node(state: TradingState) -> dict:
         )
     print(f"[technical] running for {ticker} as of {as_of}")
 
-    df, source, dropped_bars = await get_price_history(ticker, as_of)
+    try:
+        df, source, dropped_bars = await get_price_history(ticker, as_of)
+    except VendorError as exc:
+        # A vendor outage ended the whole run, discarding the fundamentals
+        # leg that had already completed and been paid for — $0.070 on FIG,
+        # 2026-09-13, when yfinance returned an empty frame and Finnhub's
+        # free tier 403'd on historical candles. Nothing about a price feed
+        # being down invalidates the filing analysis.
+        #
+        # Degrading here is not silence: the synthesizer already reports an
+        # absent analyst as a data gap, and `analyst_failures` makes this
+        # one say WHY, which an unselected analyst cannot claim. The one
+        # thing that must not happen is a memo that reads as though the
+        # technical evidence were neutral.
+        print(f"[technical] FAILED, continuing without it: {exc}")
+        logger.warning("technical analyst failed for %s: %s", ticker, exc)
+        return {"analyst_failures": [f"technical: {exc}"]}
     if dropped_bars:
         print(f"[technical] dropped {dropped_bars} incomplete bar(s) from {source}")
     indicators = compute_indicators(df)
@@ -271,6 +309,63 @@ ANALYST_OUTPUTS = {
     "technical": "technical_report",
     "news": "news_digest",
 }
+
+
+def _missing_analyst_gaps(missing: list[str], failures: list[str]) -> list[str]:
+    """One gap per analyst with no report, saying WHICH kind of absence.
+
+    An analyst that was never selected (`--only`) and one whose vendor was
+    down leave the same hole, but they are different claims about it: the
+    first means nobody asked, the second means somebody asked and the answer
+    could not be got. A memo that renders a vendor outage as "did not run"
+    invites the reader to treat the silence as deliberate.
+
+    Neither ever reads as neutral evidence — that is the point of saying
+    anything at all.
+    """
+    reasons = {
+        name.strip(): reason.strip()
+        for name, _, reason in (f.partition(":") for f in failures)
+        if reason.strip()
+    }
+    gaps = []
+    for name in missing:
+        if name in reasons:
+            gaps.append(
+                f"{name} analyst FAILED and this memo carries no {name} "
+                f"evidence as a result: {reasons[name]}"
+            )
+        else:
+            gaps.append(
+                f"{name} analyst did not run — this memo carries no {name} "
+                f"evidence at all, which is not the same as that evidence "
+                f"being neutral"
+            )
+    return gaps
+
+
+def _fundamentals_caveats(state: TradingState) -> list[str]:
+    """What the fundamentals leg could not see, for a run dated in the past.
+
+    Filing retrieval is bounded at `as_of_date` (fundamentals_port), so a
+    historical run reads only what had been filed by then — which is the
+    point. What the bound cannot reach is the model's own priors: it may
+    know perfectly well how the year turned out. Said plainly in the memo
+    rather than assumed, because "bounded retrieval" and "no knowledge of
+    later events" are not the same claim, and only the first is enforced.
+
+    Nothing to say on a run dated today: there is no "after" to leak.
+    """
+    as_of = state.get("as_of_date")
+    report = state.get("fundamentals_report")
+    if as_of is None or report is None or as_of >= date.today():
+        return []
+    return [
+        f"this is a historical run dated {as_of.isoformat()}: filing "
+        f"retrieval was bounded at that date, so the fundamentals leg read "
+        f"nothing filed after it — but the model's own prior knowledge is "
+        f"not bounded, and may include how the period turned out"
+    ]
 
 
 def _news_caveats(state: TradingState) -> tuple[list[str], list[str]]:
@@ -594,16 +689,14 @@ async def synthesizer_node(state: TradingState) -> dict:
     missing = sorted(
         name for name, key in ANALYST_OUTPUTS.items() if state.get(key) is None
     )
+    fundamentals_gaps = _fundamentals_caveats(state)
     news_gaps, news_evidence = _news_caveats(state)
     debate_gaps, debate_evidence = _debate_caveats(state)
     risk_gaps, risk_evidence, ledger = _risk_caveats(state)
 
     base_gaps = (
-        [
-            f"{name} analyst did not run — this memo carries no {name} evidence "
-            f"at all, which is not the same as that evidence being neutral"
-            for name in missing
-        ]
+        _missing_analyst_gaps(missing, state.get("analyst_failures") or [])
+        + fundamentals_gaps
         + news_gaps
         + debate_gaps
         + risk_gaps
@@ -642,6 +735,8 @@ async def synthesizer_node(state: TradingState) -> dict:
     # citations as unresolved — the context has to travel with its memo.
     contexts: list[tuple[dict, list]] = []
     dropped: list[str] = []
+    # Samples that failed with any other error — see the except below.
+    errored: list[str] = []
     # Every trial's cost is real regardless of whether its memo survives to
     # the vote — a dropped trial still spent real tokens (see
     # SynthesisFabricationError/SynthesisReferenceError's cost_events, which
@@ -674,22 +769,25 @@ async def synthesizer_node(state: TradingState) -> dict:
                 )
                 skipped = RISK_VERDICT_SAMPLES - i
                 break
-        if i == 0:
-            # The first trial reuses the graph-checkpointed panel already in
-            # `state`/`ledger` rather than sampling a fresh one — same as
-            # before this change.
-            sample_ledger, sample_state, sample_client = ledger, state, None
-        else:
-            sample_turns, sample_cost_events = await _sample_additional_risk_panel(state)
-            all_cost_events.extend(sample_cost_events)
-            sample_ledger = build_risk_ledger(sample_turns)
-            sample_state = {**state, "risk_turns": sample_turns}
-            sample_client = client
         try:
+            if i == 0:
+                # The first trial reuses the graph-checkpointed panel already
+                # in `state`/`ledger` rather than sampling a fresh one — same
+                # as before this change.
+                sample_ledger, sample_state, sample_client = ledger, state, None
+            else:
+                sample_turns, sample_cost_events = await _sample_additional_risk_panel(state)
+                all_cost_events.extend(sample_cost_events)
+                sample_ledger = build_risk_ledger(sample_turns)
+                sample_state = {**state, "risk_turns": sample_turns}
+                sample_client = client
             memo = await run_synthesis(
                 sample_state, ledger=sample_ledger, base_gaps=base_gaps,
                 base_evidence=base_evidence, as_of=as_of, client=sample_client,
             )
+        except NodeBudgetExceeded:
+            # A node's own cap is a run-level stop, not one bad sample.
+            raise
         except (SynthesisFabricationError, SynthesisReferenceError) as exc:
             print(
                 f"[synthesizer] sample {i + 1}/{RISK_VERDICT_SAMPLES} dropped by "
@@ -697,6 +795,19 @@ async def synthesizer_node(state: TradingState) -> dict:
             )
             dropped.append(str(exc))
             all_cost_events.extend(exc.cost_events)
+            continue
+        except Exception as exc:
+            # Anything else — a second schema failure, a provider error, a
+            # risk turn that raised inside an extra panel — used to escape the
+            # node and discard every sample already paid for, including ones
+            # that had passed. It is one failed vote. Its spend is on disk
+            # (log_cost writes first) and in the run summary via the disk
+            # reconciliation, though not in this node's cost_events.
+            print(
+                f"[synthesizer] sample {i + 1}/{RISK_VERDICT_SAMPLES} failed and "
+                f"was dropped: {type(exc).__name__}: {exc}"
+            )
+            errored.append(f"{type(exc).__name__}: {exc}")
             continue
         memos.append(memo)
         contexts.append((sample_state, sample_ledger))
@@ -710,6 +821,14 @@ async def synthesizer_node(state: TradingState) -> dict:
         # EVERY one of RISK_VERDICT_SAMPLES trials to trip the guard, at a
         # measured ~1-in-8 per-call rate, and the run already fails outright
         # in this case regardless of Phase 8.
+        if errored:
+            raise RuntimeError(
+                f"no risk-verdict sample for {state['ticker']} survived — "
+                f"{len(dropped)} dropped by the citation/fabrication guard, "
+                f"{len(errored)} failed with an error"
+                + (f", the rest skipped on {budget_stop.value}" if budget_stop else "")
+                + f": {dropped + errored}"
+            )
         if budget_stop is not None:
             raise SynthesisFabricationError(
                 f"no risk-verdict sample for {state['ticker']} survived — "
@@ -752,6 +871,12 @@ async def synthesizer_node(state: TradingState) -> dict:
             f"dropped by the citation/fabrication guard before voting (untrustworthy "
             f"output, not counted) — this verdict reflects only the surviving "
             f"{len(memos)} sample(s), a weaker signal than a full {RISK_VERDICT_SAMPLES}-way vote"
+        )
+    if errored:
+        extra_gaps.append(
+            f"{len(errored)} of {RISK_VERDICT_SAMPLES} risk-verdict sample(s) failed "
+            f"with an error and were dropped before voting — this verdict reflects "
+            f"only the surviving {len(memos)} sample(s): {'; '.join(errored)[:300]}"
         )
     if budget_stop is not None:
         extra_gaps.append(

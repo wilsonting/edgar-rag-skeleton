@@ -4,6 +4,9 @@
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
+# app/__init__.pyc was tracked — 102 bytes of CPython 2.7 bytecode (magic
+# 03f3 0d0a), committed before this rule existed.
+*.pyc
 
 /knowledge-base
 
@@ -20,6 +23,7 @@ extraction_truth.yaml
 # every battery manifest git_dirty. Raw run output carries local paths and
 # third-party news text.
 /docs/cost-log.jsonl
+/docs/cost-log-*.jsonl
 /docs/validation/**/*.stdout
 /docs/validation/**/*.stderr
 

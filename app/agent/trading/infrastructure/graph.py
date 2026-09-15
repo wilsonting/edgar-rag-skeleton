@@ -1,3 +1,4 @@
+import functools
 from datetime import datetime, timezone
 
 from langgraph.graph import StateGraph, START, END
@@ -24,7 +25,29 @@ from app.agent.trading.application.risk_nodes import (
     risk_close_node,
 )
 from app.agent.trading.application.risk_router import next_risk_step
+from app.agent.trading.domain.budget import NodeBudgetExceeded
 from app.agent.trading.domain.trading_state import TradingState
+
+
+def _contain_node_budget(fn):
+    """Turn a node's own spending-cap breach into state the edges can route on.
+
+    The ports' per-node caps raise NodeBudgetExceeded after the offending
+    call is paid for. Uncaught, that ended the whole process — no aborted-run
+    artifact, no run summary, and a traceback that read like a crash rather
+    than a cap doing its job. Caught here, the node returns only the breach,
+    and the next guarded edge sends the run to graceful_abort like any other
+    budget breach.
+    """
+    @functools.wraps(fn)
+    async def node(state):
+        try:
+            return await fn(state)
+        except NodeBudgetExceeded as exc:
+            print(f"[abort] node budget exceeded in {fn.__name__}: {exc}")
+            return {"node_budget_breach": str(exc)}
+
+    return node
 
 
 def _guarded(inner):
@@ -44,6 +67,8 @@ def _guarded(inner):
     route = inner if callable(inner) else (lambda state: inner)
 
     def router(state):
+        if state.get("node_budget_breach"):
+            return "abort"
         budget = state.get("budget")
         if budget is not None:
             events = state.get("cost_events") or []
@@ -143,7 +168,7 @@ def build_trading_graph(checkpointer, interrupt_after=None, analysts=None):
         + list(RISK_NODES)
         + risk_tail
     ):
-        builder.add_node(name, fn)
+        builder.add_node(name, _contain_node_budget(fn))
     builder.add_node("graceful_abort", graceful_abort_node)
 
     # Phase 8: every edge into an LLM-calling node goes through _guarded(),
@@ -196,7 +221,15 @@ def build_trading_graph(checkpointer, interrupt_after=None, analysts=None):
         builder.add_conditional_edges(
             prev, _guarded(nxt), {nxt: nxt, "abort": "graceful_abort"}
         )
-    builder.add_edge(risk_tail[-1][0], END)
+    # The synthesizer can trip its own cap too. Only that sends it to abort
+    # here: a run-level breach caused by the synthesizer's own spend happened
+    # AFTER the memo was produced, and reporting that run as aborted would
+    # hide a memo it did deliver.
+    builder.add_conditional_edges(
+        risk_tail[-1][0],
+        lambda state: "abort" if state.get("node_budget_breach") else END,
+        {END: END, "abort": "graceful_abort"},
+    )
     builder.add_edge("graceful_abort", END)
 
     return builder.compile(

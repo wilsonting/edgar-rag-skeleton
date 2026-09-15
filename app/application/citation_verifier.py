@@ -42,13 +42,19 @@ import re
 from dataclasses import dataclass, field
 from itertools import combinations, product
 
+from app.application.number_matching import (
+    NUMBER_RE as _NUMBER_RE,
+    half_step as _half_step,
+    matches_token as _matches_corpus_token,
+    number_tokens as _corpus_number_tokens,
+    number_variants as _number_variants,
+)
+
 
 # ---------------------------------------------------------------------------
 # What we pull out of an answer
 # ---------------------------------------------------------------------------
 
-# Numbers with optional thousands separators and decimals: 27,558.5  1364.1  118
-_NUMBER_RE = re.compile(r"\d[\d,]*\.?\d*")
 
 def _extract_quotes(text: str) -> list[tuple[str, int]]:
     """
@@ -127,75 +133,6 @@ class VerificationReport:
 # ---------------------------------------------------------------------------
 # Normalization — the part that decides whether this is useful or noisy
 # ---------------------------------------------------------------------------
-
-def _number_variants(raw: str) -> set[str]:
-    """
-    Every string form a filing might use for the number an answer writes
-    as `raw`. Filings write 27,558.5; answers write 27558.5 or 27,558.5.
-    Filings also write 1,364.1 where an answer may write 1364.
-    """
-    bare = raw.replace(",", "")
-    variants = {raw, bare}
-
-    try:
-        val = float(bare)
-    except ValueError:
-        return variants
-
-    # comma-grouped form
-    if val == int(val):
-        variants.add(f"{int(val):,}")
-        variants.add(str(int(val)))
-    else:
-        variants.add(f"{val:,}")
-        # trailing-zero and one-decimal forms: 1364.10 -> 1364.1
-        variants.add(f"{val:,.1f}")
-        variants.add(f"{val:.1f}")
-        variants.add(f"{val:,.2f}")
-
-    return {v for v in variants if v}
-
-
-def _corpus_number_tokens(text: str) -> list[str]:
-    """Every standalone numeric token in `text`, as `_NUMBER_RE` finds it.
-
-    finditer already tokenizes atomically — on "$3,420.5 thousand" it
-    yields the single token "3,420.5", never a spurious "420.5" — so this
-    exists to make that tokenization explicit and reusable, not to add new
-    parsing behavior."""
-    return [m.group().rstrip(".") for m in _NUMBER_RE.finditer(text) if m.group().rstrip(".")]
-
-
-def _matches_corpus_token(raw: str, variants: set[str], token: str) -> bool:
-    """True if the memo number `raw` matches this single corpus token —
-    exactly, as an integer truncation of a more precise filing figure
-    (filing writes "1,364.1", memo writes "1364"), or as a rounding of it
-    at the memo's own displayed precision (extract_metrics returns
-    10874.36, memo writes "10,874.4" — within half a step of the memo's
-    last decimal, so a legitimate restatement, not an invention).
-
-    Deliberately NOT a substring check (`variant in token` or `variant in
-    text`): that allowed a memo figure to "verify" merely by occurring
-    inside an unrelated, larger corpus number that happens to contain the
-    same digits — e.g. a fabricated "420.5" matched because "3,420.5"
-    (a different figure entirely) appeared somewhere in the corpus.
-    Matching against whole tokens, with truncation and rounding as the
-    only numeric slop — both bounded by the memo's displayed precision —
-    closes that gap while keeping the restatement cases the substring
-    check was originally added for.
-    """
-    bare_token = token.replace(",", "")
-    for v in variants:
-        bare_v = v.replace(",", "")
-        if v == token or bare_v == bare_token:
-            return True
-        if bare_token.startswith(bare_v + "."):
-            return True
-    try:
-        return abs(float(bare_token) - float(raw.replace(",", ""))) <= _half_step(raw)
-    except ValueError:
-        return False
-
 
 def _normalize_text(s: str) -> str:
     """Collapse whitespace and smart quotes so quote matching survives
@@ -316,15 +253,6 @@ def _corpus_values(corpus: str) -> list[float]:
             continue
         out.append(-v if neg else v)
     return out
-
-
-def _half_step(raw: str) -> float:
-    """Half of one step in `raw`'s last displayed decimal place — the
-    largest distance a source figure can sit from `raw` while still
-    legitimately rounding to it. "877.4" -> 0.05; "615" -> 0.5."""
-    bare = raw.replace(",", "")
-    decimals = len(bare.split(".")[1]) if "." in bare else 0
-    return 0.5 * 10 ** -decimals
 
 
 def _matches_with_scale(value: float, raw: str, corpus_values: list[float]) -> bool:

@@ -1,14 +1,25 @@
-from contextlib import asynccontextmanager
+# Entry point (uvicorn app.main:app): .env first, before any app import reads
+# its settings. See app/config.py.
+from app.config import load_env, require_env
+
+load_env()
+
+import asyncio  # noqa: E402
+from contextlib import asynccontextmanager  # noqa: E402
 from dataclasses import asdict
 import logging
 import os
 from pathlib import Path
 from typing import Literal
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Response
 
+import secrets
+
+from fastapi import Depends, Header
+
 from app.domain.token_usage import USAGE_HEADER, TokenUsage, encode_usage_header
-from pydantic import BaseModel, Field
+from app.domain.values import Ticker, normalize_ticker
+from pydantic import BaseModel, ConfigDict, Field
 from datetime import date, timedelta
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -29,9 +40,10 @@ from app.application.embedding_service import EmbeddingService
 from app.application.extraction_service import FinancialMetrics, MetricsExtractor
 from app.application.ingestion_service import IngestionService
 from app.application.query_decomposer import QueryDecomposer
-from app.application.retrieval_service import RetrievalService
+from app.application.retrieval_service import RetrievalService, _fuse_across_queries
 from app.application.citations import format_citation_tag
 
+from app.infrastructure.build_info import build_info
 from app.infrastructure.llm.models import model_for
 from app.infrastructure.edgar.client import EdgarClient, periodic_forms
 from app.infrastructure.edgar.ticker_resolver import TickerResolver
@@ -47,27 +59,63 @@ from app.infrastructure.repositories.document_repo import DocumentRepository
 from app.infrastructure.repositories.filing_repo import FilingRepository
 from app.infrastructure.repositories.listed_security_repo import ListedSecurityRepository
 from app.infrastructure.repositories.section_repo import SectionRepository
-from app.infrastructure.repositories.metrics_repo import MetricsRepository
+from app.infrastructure.repositories.metrics_repo import (
+    FinancialMetricsRow,
+    MetricsRepository,
+)
 from app.llm import answer_question
 
 
-load_dotenv(override=True)
 logging.basicConfig(level=logging.INFO)
 claude_model = model_for("answer")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.infrastructure.build_info import describe
+    logging.info("serving code at %s", describe())
     await init_pool()
+    # Built once and shared, instead of per request: every /ask and /extract
+    # used to construct a fresh OpenAI client and a fresh decomposer client,
+    # so no HTTP connection was ever reused. Best-effort — a missing key or
+    # provider config leaves them unset and the endpoints build their own,
+    # failing then with the same error they always did.
+    for name, factory in (("embedder", EmbeddingService), ("decomposer", QueryDecomposer)):
+        try:
+            setattr(app.state, name, factory())
+        except Exception as exc:
+            logging.warning("not sharing a %s client: %s", name, exc)
     async with build_checkpointer() as checkpointer:
         app.state.trading_graph = build_trading_graph(checkpointer)
         yield
     await close_pool()
 
+
+def _embedder() -> EmbeddingService:
+    return getattr(app.state, "embedder", None) or EmbeddingService()
+
+
+def _decomposer() -> QueryDecomposer:
+    return getattr(app.state, "decomposer", None) or QueryDecomposer()
+
 app = FastAPI(title="RAG Skeleton", lifespan=lifespan)
+
+# Browsers may call this API only from these origins. It was "*", which let
+# ANY page open in the user's browser send requests to localhost:8000 — and
+# /ask, /extract, /ingest, /news-assess and /trading/analyze all spend API
+# credits. The default is the Vite dev server the removed edgar-ui ran on;
+# set CORS_ALLOW_ORIGINS (comma-separated) for anything else, or to "" to
+# allow no browser origin at all.
+CORS_ALLOW_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+    ).split(",")
+    if o.strip()
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten to your actual origin once you know it
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -75,9 +123,17 @@ app.add_middleware(
 # ---- Request / response models ----
 
 class AskRequest(BaseModel):
+    # A field the server does not understand is a 422, not a shrug. Pydantic's
+    # default is to DROP unknown fields, and that is how a 22-hour-stale
+    # server accepted `filed_before` on /latest-filings and silently
+    # discarded the bound: the caller was told nothing, and a historical run
+    # read filings it was not supposed to see. Failing on the first call
+    # beats a wrong answer thirty calls later.
+    model_config = ConfigDict(extra="forbid")
+
     question: str
     k: int = 8
-    tickers: list[str] | None = None
+    tickers: list[Ticker] | None = None
     filing_types: list[str] | None = None
     filed_after: date | None = None
     filed_before: date | None = None
@@ -104,9 +160,19 @@ class AskResponse(BaseModel):
     citations: list[str]
     unverified: list[str] = []
     chunks: list[RetrievedChunkResponse]
+    dropped_section_filter: list[str] | None = Field(
+        default=None,
+        description=(
+            "Sections that were asked for but match no chunk in this corpus. "
+            "When set, the answer was produced WITHOUT the section filter."
+        ),
+    )
 
 class ExtractRequest(BaseModel):
-    ticker: str
+    # See AskRequest: unknown fields are rejected, not dropped.
+    model_config = ConfigDict(extra="forbid")
+
+    ticker: Ticker
     fiscal_period: str          # "Q1 2026" — you supply this, it's not extracted
     filing_type: str            # "10-Q"
     filed_date: date
@@ -120,7 +186,10 @@ class FinancialMetricsResponse(BaseModel):
     citations: list[str]
 
 class NewsAssessRequest(BaseModel):
-    ticker: str
+    # See AskRequest: unknown fields are rejected, not dropped.
+    model_config = ConfigDict(extra="forbid")
+
+    ticker: Ticker
     headline: str
 
 class NewsAssessResponse(BaseModel):
@@ -129,19 +198,32 @@ class NewsAssessResponse(BaseModel):
     assessment: str
 
 class IngestRequest(BaseModel):
-    ticker: str
+    # See AskRequest: unknown fields are rejected, not dropped.
+    model_config = ConfigDict(extra="forbid")
+
+    ticker: Ticker
     # None = auto-detect: 10-K for a domestic filer, 20-F for a foreign
     # private issuer (see EdgarClient.default_form_types). Pass explicitly
     # to override, e.g. "10-Q" or "6-K".
     form_type: str | None = None
     limit: int = 3
     since_year: int | None = None
+    # Re-run filings a previous ingest marked FAILED (they are skipped
+    # otherwise). See IngestionService.ingest_security.
+    retry_failed: bool = False
 
 class LatestFilingsRequest(BaseModel):
-    ticker: str
+    # See AskRequest: unknown fields are rejected, not dropped.
+    model_config = ConfigDict(extra="forbid")
+
+    ticker: Ticker
     # None = auto-detect the filer's form-type family (see IngestRequest).
     form_types: list[str] | None = None
     since_year: int | None = None
+    # Upper bound on the filing date. A historical run must not be shown
+    # filings published after the date it is analysing — knowing a 10-K
+    # exists is itself lookahead, even before anything is read from it.
+    filed_before: date | None = None
     # Narrow the auto-detected family to its PERIODIC members (10-K/10-Q, or
     # 20-F), dropping the event-driven ones. Defaults on because a
     # fundamentals checklist is built from periodic reports and the event
@@ -150,6 +232,30 @@ class LatestFilingsRequest(BaseModel):
     # for the rest of the run. Ignored when `form_types` is given explicitly:
     # a caller naming its forms has already said what it wants.
     periodic_only: bool = True
+
+# ---- Auth ----
+API_KEY_HEADER = "X-API-Key"
+
+
+def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    """Opt-in shared secret for the endpoints that spend money.
+
+    Unset `APP_API_KEY` leaves them open — the previous behaviour, and fine
+    for a server bound to 127.0.0.1 (uvicorn's default). Set it whenever the
+    server is reachable by anything but you: every spending endpoint then
+    needs a matching `X-API-Key` header, and the research agent's own tool
+    calls send it automatically (app/agent/tools.py reads the same variable).
+    Read per request so a test or a restart-free change can move it.
+    """
+    expected = os.getenv("APP_API_KEY")
+    if not expected:
+        return
+    if not x_api_key or not secrets.compare_digest(x_api_key, expected):
+        raise HTTPException(401, f"missing or invalid {API_KEY_HEADER} header")
+
+
+SPENDS_MONEY = [Depends(require_api_key)]
+
 
 # ---- Endpoint ----
 def _report_usage(response: Response, *usages: tuple[str, TokenUsage]) -> None:
@@ -172,26 +278,39 @@ def _report_usage(response: Response, *usages: tuple[str, TokenUsage]) -> None:
     response.headers[USAGE_HEADER] = encode_usage_header(usages)
 
 
-@app.post("/ask",  response_model=AskResponse)
+@app.post("/ask",  response_model=AskResponse, dependencies=SPENDS_MONEY)
 async def ask(req: AskRequest, response: Response) -> AskResponse:
     if not req.question.strip():
         raise HTTPException(400, "question must not be empty")
 
-    embedder = EmbeddingService()
+    embedder = _embedder()
     chunk_repo = ChunkRepository()
-    decomposer = QueryDecomposer()
+    decomposer = _decomposer()
     retrieval = RetrievalService(
         embedding_service=embedder, 
         chunk_repo=chunk_repo,
-        decomposer=decomposer,
-        use_hybrid=True)
+        decomposer=decomposer)
+
+    sections = req.section_path_contains
+    if sections:
+        # An unmatched section name retrieves nothing, and an empty answer
+        # reads to the caller as "the filing doesn't say" rather than "you
+        # spelled the section wrong". Drop the filter and say so, instead of
+        # spending the answer call on no excerpts at all.
+        matched = await chunk_repo.sections_with_content(sections, req.tickers)
+        if not matched:
+            logging.warning(
+                "/ask: no chunk is filed under %s; answering without the "
+                "section filter", sections,
+            )
+            sections = None
 
     filters = ChunkSearchFilters(
         tickers=req.tickers,
         filing_types=req.filing_types,
         filed_after=req.filed_after,
         filed_before=req.filed_before,
-        section_path_contains=req.section_path_contains,
+        section_path_contains=sections,
     )
 
     chunks, decomposition = await retrieval.retrieve_full(req.question, k=req.k, filters=filters)
@@ -227,87 +346,121 @@ async def ask(req: AskRequest, response: Response) -> AskResponse:
             )
             for c in chunks
         ],
+        dropped_section_filter=(
+            req.section_path_contains if sections is None and req.section_path_contains
+            else None
+        ),
     )
 
 
-@app.post("/extract", response_model=FinancialMetrics)
+@app.post("/extract", response_model=FinancialMetrics, dependencies=SPENDS_MONEY)
 async def extract(req: ExtractRequest, response: Response) -> FinancialMetrics:
-    embedder = EmbeddingService()
+    embedder = _embedder()
     chunk_repo = ChunkRepository()
-    decomposer = QueryDecomposer()
+    decomposer = _decomposer()
     retrieval = RetrievalService(
         embedding_service=embedder, 
         chunk_repo=chunk_repo,
-        decomposer=decomposer,
-        use_hybrid=True)
+        decomposer=decomposer)
     extractor = MetricsExtractor()
-    metrics_repo = MetricsRepository(session_factory=None)
+    metrics_repo = MetricsRepository()
 
-    # In extract() endpoint, before gather_extraction_chunks:
-    window_start = req.filed_date - timedelta(days=30)
-    window_end = req.filed_date + timedelta(days=30)
+    # The window defaults to filed_date ± 30 days; a caller that names its
+    # own bounds gets them. The extract_metrics tool has always offered
+    # filed_after/filed_before to the agent, and they used to be ignored
+    # here, so the agent was steering with a control connected to nothing.
+    window_start = req.filed_after or req.filed_date - timedelta(days=30)
+    window_end = req.filed_before or req.filed_date + timedelta(days=30)
+    if window_start > window_end:
+        raise HTTPException(
+            400, f"filed_after {window_start} is later than filed_before {window_end}"
+        )
     chunks = await gather_extraction_chunks(retrieval, req.ticker, window_start, window_end)
     extracted = await extractor.extract(chunks, req.ticker, req.fiscal_period, req.filing_type, req.filed_date)
-    # `gather_extraction_chunks` runs retrieval, which may invoke the
-    # decomposer; that path does not surface a DecompositionResult here, so
-    # only the extraction call is reported. Under-reporting by the
-    # decomposer's share is the conservative direction and is noted rather
-    # than silently accepted -- see trading-agent-known-gaps.md.
+    # Only the extraction call spends here: gather_extraction_chunks runs
+    # fixed queries through retrieve_hybrid, which never calls the decomposer.
     _report_usage(response, (extractor.llm_model, extractor.last_usage))
-    from app.infrastructure.repositories.metrics_repo import FinancialMetrics as MetricsRow
-    row = MetricsRow(
+    # Built through the one constructor both writers share, so the fields
+    # the extractor's model does not carry cannot be dropped here either.
+    await metrics_repo.upsert(FinancialMetricsRow.from_extraction(
+        extracted,
         ticker=req.ticker,
         fiscal_period=req.fiscal_period,
         filing_type=req.filing_type,
         filed_date=req.filed_date,
-        revenue=extracted.revenue,
-        gross_margin_pct=extracted.gross_margin_pct,
-        gaap_net_income=extracted.gaap_net_income,
-        free_cash_flow=extracted.free_cash_flow,
-        sbc_pct_of_revenue=extracted.sbc_pct_of_revenue,
-        net_dollar_retention=extracted.net_dollar_retention,
-        extraction_confidence=extracted.extraction_confidence,
-        reasoning=extracted.reasoning,
         source_citations=[format_citation_tag(c) for c in chunks],
-    )
-    await metrics_repo.upsert(row)
+    ))
     return extracted
 
 async def gather_extraction_chunks(retrieval: RetrievalService, ticker: str, filed_after, filed_before):
+    """The four fixed metric queries, fused into one list.
+
+    Concurrent rather than one at a time, and fused by SUMMING each chunk's
+    RRF score across the queries that found it rather than keeping the max —
+    both for the reasons `_fuse_across_queries` gives. A chunk the cash-flow
+    and income-statement queries both surface is more likely to be the
+    statements page than one only a single query reached.
+    """
     filters = ChunkSearchFilters(tickers=[ticker], filed_after=filed_after, filed_before=filed_before)
-    seen: dict[int, RetrievedChunk] = {}
-    for query in RetrievalService.METRIC_QUERIES.values():
-        results = await retrieval.retrieve_hybrid(query, k=5, filters=filters)
-        for chunk in results:
-            cid = chunk.chunk.id
-            if cid not in seen or chunk.similarity > seen[cid].similarity:
-                seen[cid] = chunk
-    return list(seen.values())
+    per_query = await asyncio.gather(*(
+        retrieval.retrieve_hybrid(query, k=5, filters=filters)
+        for query in RetrievalService.METRIC_QUERIES.values()
+    ))
+    # No top-k truncation here: the extractor wants every distinct chunk the
+    # four queries found, ordered by how much of the set agreed on it.
+    return _fuse_across_queries(per_query, k=sum(len(r) for r in per_query))
+
+@app.get("/health")
+async def health():
+    """What code this process is running.
+
+    Exists because a 22-hour-stale uvicorn served a whole FIG pipeline run
+    on 2026-09-13 with no symptom but a date bound that silently did
+    nothing. `commit` is snapshotted at import, so it is the RUNNING
+    process's commit, not the working tree's.
+    """
+    return {"status": "ok", **build_info()}
+
 
 @app.get("/corpus-status")
-async def corpus_status_endpoint(ticker: str | None = None):
+async def corpus_status_endpoint(ticker: str | None = None, filed_before: date | None = None):
+    """`filed_before` bounds every section at the caller's analysis date.
+
+    A historical run could not READ a later filing but could still SEE it:
+    a live FIG run at --as-of 2026-03-01 listed two post-cutoff 10-Qs by
+    date in its own memo. Knowing a filing exists, and when, is information
+    from after the cutoff.
+    """
+    if ticker is not None:
+        try:
+            ticker = normalize_ticker(ticker)
+        except ValueError as e:
+            raise HTTPException(422, str(e))
     query = CorpusStatusQuery()
-    summary = await query.summary(ticker)
+    summary = await query.summary(ticker, filed_before)
     if not summary:
         return {"summary": [], "issues": [], "per_filing": []}
 
-    issues = await query.issues(ticker)
-    per_filing = await query.per_filing(ticker)
-    
+    issues = await query.issues(ticker, filed_before)
+    per_filing = await query.per_filing(ticker, filed_before)
+
     return {
         "summary": [asdict(row) for row in summary],
         "issues": [asdict(i) for i in issues],
         "per_filing": [asdict(d) for d in per_filing],
+        # What `ask_edgar`'s `sections` filter will actually match. Without
+        # this the agent guesses note titles, and the filter is dropped.
+        "sections_available": await query.item_sections(ticker, filed_before),
     }
 
-@app.post("/ingest")
+@app.post("/ingest", dependencies=SPENDS_MONEY)
 async def ingest_endpoint(req: IngestRequest):
-    user_agent = os.environ["EDGAR_USER_AGENT"]
+    user_agent = require_env("EDGAR_USER_AGENT")
     cache_root = Path(os.environ.get("EDGAR_CACHE_DIR", "./data/edgar-cache"))
 
     async with EdgarClient(user_agent, cache_root / "filings") as edgar:
         resolver = TickerResolver(user_agent, cache_root / "company_tickers.json")
-        embedder = EmbeddingService()
+        embedder = _embedder()
         service = IngestionService(
             edgar_client=edgar,
             ticker_resolver=resolver,
@@ -324,6 +477,7 @@ async def ingest_endpoint(req: IngestRequest):
             form_types=[req.form_type] if req.form_type else None,
             limit=req.limit,
             since=since,
+            retry_failed=req.retry_failed,
         )
 
     return {"status": "ok", "ticker": req.ticker, "limit": req.limit}
@@ -331,7 +485,7 @@ async def ingest_endpoint(req: IngestRequest):
 
 @app.post("/latest-filings")
 async def latest_filings_endpoint(req: LatestFilingsRequest):
-    user_agent = os.environ["EDGAR_USER_AGENT"]
+    user_agent = require_env("EDGAR_USER_AGENT")
     cache_root = Path(os.environ.get("EDGAR_CACHE_DIR", "./data/edgar-cache"))
 
     async with EdgarClient(user_agent, cache_root / "filings") as edgar:
@@ -350,6 +504,9 @@ async def latest_filings_endpoint(req: LatestFilingsRequest):
         sec_filings = await edgar.list_filings(
             cik=cik, form_types=form_types, since=since,
         )
+
+    if req.filed_before:
+        sec_filings = [f for f in sec_filings if f.filing_date <= req.filed_before]
 
     accession_numbers = [f.accession_number for f in sec_filings]
     ingested: dict[str, str] = {}
@@ -383,6 +540,8 @@ async def latest_filings_endpoint(req: LatestFilingsRequest):
     return {
         "ticker": req.ticker.upper(),
         "form_types_searched": form_types,
+        # Echoed so a reader of the agent's trace can see the run was bounded.
+        "filed_before": req.filed_before.isoformat() if req.filed_before else None,
         "total_on_sec": len(filings_list),
         "already_ingested": len(filings_list) - len(new_filings),
         "new_filings_count": len(new_filings),
@@ -390,7 +549,7 @@ async def latest_filings_endpoint(req: LatestFilingsRequest):
     }
 
 
-@app.post("/news-assess", response_model=NewsAssessResponse)
+@app.post("/news-assess", response_model=NewsAssessResponse, dependencies=SPENDS_MONEY)
 async def news_assess(req: NewsAssessRequest) -> NewsAssessResponse:
     if not req.headline.strip():
         raise HTTPException(400, "headline must not be empty")
@@ -412,7 +571,10 @@ async def news_assess(req: NewsAssessRequest) -> NewsAssessResponse:
 
 
 class TradingAnalysisRequest(BaseModel):
-    ticker: str
+    # See AskRequest: unknown fields are rejected, not dropped.
+    model_config = ConfigDict(extra="forbid")
+
+    ticker: Ticker
     thread_id: str | None = None
     # Same defaults as the CLI. `as_of_date` falls back to today HERE, at the
     # boundary — never inside a node (see TradingState.as_of_date). All three
@@ -431,7 +593,7 @@ class TradingAnalysisResponse(BaseModel):
     run_terminated_by: str | None = None
 
 
-@app.post("/trading/analyze", response_model=TradingAnalysisResponse)
+@app.post("/trading/analyze", response_model=TradingAnalysisResponse, dependencies=SPENDS_MONEY)
 async def trading_analyze(req: TradingAnalysisRequest) -> TradingAnalysisResponse:
     """Run the trading pipeline for one ticker, exactly as the CLI does.
 

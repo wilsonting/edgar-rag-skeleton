@@ -41,9 +41,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # The constraint lives on financial_metrics, not on a table called
+    # "ticker" — this downgrade could never have run.
     op.drop_constraint(
-        constraint_name="uq_metric_period",  
-        table_name="ticker",              
-        type_="unique"                   
+        constraint_name="uq_metric_period",
+        table_name="financial_metrics",
+        type_="unique",
     )
     op.drop_table("financial_metrics")

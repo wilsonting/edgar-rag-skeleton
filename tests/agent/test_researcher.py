@@ -231,9 +231,9 @@ def test_the_date_folder_comes_from_the_run_start_not_the_save_time(tmp_path, mo
 
 def test_the_run_folder_is_restored_on_exit(tmp_path, monkeypatch):
     monkeypatch.setattr(researcher, "MEMO_DIR", tmp_path)
-    assert researcher._RUN_STAMP is None
+    assert researcher._RUN_STAMP.get() is None
 
     with researcher.vault_run():
-        assert researcher._RUN_STAMP is not None
+        assert researcher._RUN_STAMP.get() is not None
 
-    assert researcher._RUN_STAMP is None
+    assert researcher._RUN_STAMP.get() is None

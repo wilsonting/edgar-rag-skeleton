@@ -27,8 +27,15 @@ _CACHE_DIR = Path(__file__).resolve().parents[1] / ".fundamentals_cache"
 _USE_MOCK = os.getenv("MOCK_FUNDAMENTALS", "").strip() == "1"
 
 
-def _cache_path(ticker: str) -> Path:
-    return _CACHE_DIR / f"{ticker.upper()}.json"
+def _cache_path(ticker: str, as_of: date) -> Path:
+    """Keyed on the analysis date as well as the ticker.
+
+    On ticker alone, a cached August memo answered a March run — the cache
+    is written on every real run and read under MOCK_FUNDAMENTALS, so one
+    environment variable was all that stood between a historical probe and
+    a report from a different date.
+    """
+    return _CACHE_DIR / f"{ticker.upper()}-{as_of.isoformat()}.json"
 
 
 def _spend_so_far(usage: UsageSummary) -> float:
@@ -85,23 +92,45 @@ def budget_stop_check(
 
 async def get_fundamentals_report(
     ticker: str,
+    as_of: date,
     run_id: str | None = None,
     *,
     budget: RunBudget | None = None,
     prior_events: list[CostEvent] | None = None,
 ) -> FundamentalsReport:
-    cached = _cache_path(ticker)
+    """The fundamentals leg, bounded at `as_of` like every other source.
+
+    `as_of` is required, not defaulted. This node used to call
+    `date.today()` and never receive the run's analysis date at all, so a
+    `--as-of 2026-03-01` run bounded its prices and news at March and let
+    its most heavily-weighted analyst read whatever had been filed since —
+    and the memo said nothing about it. Prices and news already refuse to
+    run without the date (nodes.technical_node, nodes.news_node); this now
+    does too, by taking it as a positional argument nothing can omit.
+
+    The bound is enforced in the tools, not in the prompt: `run_agent`
+    puts it in the run state and every filing-reading tool sends
+    `filed_before` with it. Wording alone would leave the hole open on any
+    turn the model did not think about it.
+    """
+    cached = _cache_path(ticker, as_of)
 
     if _USE_MOCK and cached.exists():
         report = FundamentalsReport.model_validate_json(cached.read_text())
-        age_days = (date.today() - report.generated_at).days
-        print(f"[fundamentals] loading cached report for {ticker} ({age_days}d old)")
+        print(f"[fundamentals] loading cached report for {ticker} as of {as_of}")
         return report
 
-    today = date.today()
-    task = f"Today's date is {today.isoformat()}. Run the full research checklist for {ticker}."
+    task = (
+        f"The analysis date is {as_of.isoformat()}. Run the full research "
+        f"checklist for {ticker}. Filing retrieval is bounded at that date, "
+        f"so anything filed after it is deliberately unavailable to you — "
+        f"report what is missing as a data gap rather than reasoning from "
+        f"memory about it."
+    )
     result, usage = await run_agent(
-        task, ANALYST_SYSTEM_PROMPT, stop_check=budget_stop_check(budget, prior_events)
+        task, ANALYST_SYSTEM_PROMPT,
+        stop_check=budget_stop_check(budget, prior_events),
+        as_of=as_of,
     )
 
     event_id = new_event_id("fundamentals")
@@ -145,7 +174,10 @@ async def get_fundamentals_report(
         cache_write_tokens=usage.cache_write_tokens,
         cache_read_tokens=usage.cache_read_tokens,
         output_tokens=usage.output_tokens,
-        generated_at=today,
+        # The analysis date, not the wall clock: a report generated today
+        # about March is a March report, and dating it today is how a
+        # historical probe comes to look current.
+        generated_at=as_of,
         cost_event=record_cost_event(event_id, "fundamentals", usage, AGENT_MODEL, cost),
         tool_cost_events=tool_events,
     )

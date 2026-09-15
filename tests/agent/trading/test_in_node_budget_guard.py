@@ -11,7 +11,7 @@ paid for." These pin the in-node checks.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -59,6 +59,19 @@ def _tool_use(i: int):
     return SimpleNamespace(type="tool_use", id=f"t{i}", name="check_corpus", input={"ticker": "ACN"})
 
 
+def _text(content) -> str:
+    """A turn's text, whether it is a bare string or content blocks.
+
+    Every call now goes through `_roll_cache_breakpoint`, which wraps a
+    string turn so the breakpoint has a block to attach to.
+    """
+    if isinstance(content, str):
+        return content
+    return " ".join(
+        b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+    )
+
+
 class FakeAgentClient:
     """Answers every turn with tool calls, and the forced-memo turn (the one
     whose last message is the budget note) with a memo."""
@@ -66,13 +79,15 @@ class FakeAgentClient:
     def __init__(self, tools_per_turn: int = 1):
         self.tools_per_turn = tools_per_turn
         self.calls: list[list[dict]] = []
+        self.requests: list[dict] = []
         self.messages = self
 
     async def create(self, **kwargs):
         messages = kwargs["messages"]
         self.calls.append(messages)
-        last = messages[-1]["content"]
-        if isinstance(last, str) and "Write the memo now" in last:
+        self.requests.append(kwargs)
+        last = _text(messages[-1]["content"])
+        if "Write the memo now" in last:
             return SimpleNamespace(
                 content=[SimpleNamespace(type="text", text="# ACN memo\n## Assessment\nstub")],
                 stop_reason="end_turn", usage=_usage(),
@@ -112,7 +127,9 @@ async def test_the_loop_stops_when_the_check_fires_and_still_writes_a_memo(agent
     assert agent.executed == ["check_corpus"]  # turn 2's tool was refused
     refused = agent.client.calls[2][-2]["content"][0]["content"]
     assert refused.startswith("RUN BUDGET REACHED: budget_exceeded")
-    assert "spending or time budget has been reached (budget_exceeded)" in agent.client.calls[2][-1]["content"]
+    assert "spending or time budget has been reached (budget_exceeded)" in _text(
+        agent.client.calls[2][-1]["content"]
+    )
     assert usage.output_tokens == 30
 
 
@@ -125,10 +142,12 @@ async def test_a_breach_before_the_first_turn_spends_only_the_memo_call(agent):
 
 
 @pytest.mark.anyio
-async def test_a_breach_mid_turn_refuses_the_remaining_tool_calls(agent):
+async def test_a_breach_mid_turn_refuses_the_remaining_tool_calls(agent, monkeypatch):
     """One turn can carry several tool calls (gpt-5.6-luna sent 6-7
     ask_edgar calls per turn on 2026-09-11), each with its own server-side
-    spend — so the check runs per call, not only per turn."""
+    spend — so the check runs before each wave of calls, not only per turn.
+    At concurrency 1 a wave is one call: the strictest setting."""
+    monkeypatch.setattr(researcher, "TOOL_CONCURRENCY", 1)
     agent.client.tools_per_turn = 3
     stop = lambda usage: "budget_exceeded" if agent.executed else None
 
@@ -148,7 +167,7 @@ async def test_without_a_check_the_loop_is_unchanged(agent, monkeypatch):
 
     assert len(agent.client.calls) == 3        # both turns, then the MAX_TURNS memo
     assert agent.executed == ["check_corpus", "check_corpus"]
-    assert "exhausted your tool-call budget" in agent.client.calls[-1][-1]["content"]
+    assert "exhausted your tool-call budget" in _text(agent.client.calls[-1][-1]["content"])
 
 
 # ---------------------------------------------------------------------------
@@ -196,16 +215,22 @@ def test_a_passed_deadline_stops_the_loop(monkeypatch):
 async def test_the_fundamentals_node_hands_the_port_its_budget_and_prior_spend(monkeypatch):
     seen = {}
 
-    async def fake_report(ticker, run_id=None, **kwargs):
+    async def fake_report(ticker, as_of=None, run_id=None, **kwargs):
+        seen["as_of"] = as_of
         seen.update(kwargs)
         return None
 
     monkeypatch.setattr(nodes, "get_fundamentals_report", fake_report)
     budget, prior = _budget(0.75), [_event(0.05)]
 
-    await nodes.fundamentals_node({"ticker": "ACN", "budget": budget, "cost_events": prior})
+    as_of = date(2026, 8, 19)
+    await nodes.fundamentals_node(
+        {"ticker": "ACN", "as_of_date": as_of, "budget": budget, "cost_events": prior}
+    )
 
-    assert seen == {"budget": budget, "prior_events": prior}
+    # The analysis date rides with the budget: the node cannot pass one and
+    # forget the other.
+    assert seen == {"as_of": as_of, "budget": budget, "prior_events": prior}
 
 
 # ---------------------------------------------------------------------------

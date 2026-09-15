@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from app.config import require_env
 from app.infrastructure.llm.pricing import MODEL_PRICING
 
 # The project-wide default. Required: there is no sensible built-in model id
@@ -77,13 +78,9 @@ def model_for(key: str) -> str:
     if role is None:
         raise KeyError(f"unknown model role {key!r} — known roles: {sorted(_BY_KEY)}")
 
-    explicit = os.getenv(role.env)
-    if explicit:
-        return explicit
-    if role.env == DEFAULT_MODEL_ENV:
-        # The one role with nothing to fall back to.
-        return os.environ[DEFAULT_MODEL_ENV]
-    return os.environ[DEFAULT_MODEL_ENV]
+    # Every role falls back to the project-wide default, which is the one
+    # variable with nothing behind it.
+    return os.getenv(role.env) or require_env(DEFAULT_MODEL_ENV)
 
 
 def model_env_vars() -> list[str]:
@@ -152,7 +149,7 @@ def describe() -> str:
 
 
 if __name__ == "__main__":
-    from dotenv import load_dotenv
+    from app.config import load_env
 
-    load_dotenv()
+    load_env()
     print(describe())

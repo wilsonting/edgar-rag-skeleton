@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from app.agent.trading.infrastructure.structured_call import assert_within_budget
 from app.infrastructure.llm import LLMClient, get_client
 from app.infrastructure.llm.models import model_for, warn_if_unpriced
 
@@ -279,11 +280,14 @@ def _assert_within_budget(cost: float | None) -> None:
     It fires only after the batches have been paid for, which is precisely
     why the cap has to be the thing that bounds spend: an assertion here
     cannot refund a run it failed."""
-    if cost is not None and cost > NEWS_BUDGET_USD:
-        raise AssertionError(
-            f"news digest cost ${cost:.4f} exceeds the ${NEWS_BUDGET_USD:.2f} "
-            f"per-run budget — check TRADING_NEWS_DIGEST_MODEL routing before rerunning"
-        )
+    if cost is None:
+        return
+    assert_within_budget(
+        cost, NEWS_BUDGET_USD,
+        what="news digest",
+        budget="per-run budget",
+        check="TRADING_NEWS_DIGEST_MODEL routing",
+    )
 
 
 async def build_digest(

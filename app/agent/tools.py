@@ -8,11 +8,15 @@ import operator
 import os
 import re
 import sys
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from datetime import date
 
 import httpx
 from pydantic import ValidationError
 
 from app.domain.token_usage import USAGE_HEADER, TokenUsage, decode_usage_header
+from app.application.number_matching import value_in_text, value_spans
 
 
 # Base URL of your running FastAPI server. Override when you wire step 2.
@@ -62,15 +66,14 @@ ASK_EDGAR_MAX_CALLS = int(os.getenv("ASK_EDGAR_MAX_CALLS", "30"))
 ASK_EDGAR_K = int(os.getenv("ASK_EDGAR_K", "8"))
 # How many calls out from the cap the agent starts being told to wrap up.
 _ASK_EDGAR_WARN_AT = 5
-_ASK_EDGAR_CALLS = 0
 
-# Results by normalized expression, for the run. Whitespace only: two
+# The calculate cache (_RunState.calc_cache) is keyed by normalized
+# expression. Whitespace only: two
 # expressions that differ in spacing are the same computation, while two
 # that differ in SCALE ("45183.036 - 39001.0" vs "45183036 - 39001000") are
 # deliberately kept apart even though they reduce to the same ratio — a
 # cache is not the place to assert that two differently-written derivations
 # are equivalent.
-_CALC_CACHE: dict[str, str] = {}
 _CALC_WHITESPACE = re.compile(r"\s+")
 
 
@@ -88,7 +91,9 @@ TOOLS = [
         "description": (
             "Check what filings are available for a ticker before asking "
             "questions. Always call this first for any ticker. Returns filing "
-            "count, date range, and chunk counts."
+            "count, date range, chunk counts, and `sections_available` — the "
+            "only section names ask_edgar's `sections` filter will match. "
+            "Read that list before using the filter."
         ),
         "input_schema": {
             "type": "object",
@@ -130,20 +135,49 @@ TOOLS = [
             "with citations and source excerpts. Best for cross-section "
             "analysis, year-over-year comparisons, risk factors, MD&A "
             "commentary, and segment breakdowns.\n\n"
+            "ONE QUESTION PER CALL. Retrieval embeds your question as a "
+            "whole, so a question that fuses several topics lands between "
+            "them and retrieves the excerpts for none of them. If you catch "
+            "yourself joining clauses with ';' or 'and separately', split "
+            "them into separate calls. One thing, asked plainly, is what "
+            "works.\n\n"
             f"BUDGETED: you may call this at most {ASK_EDGAR_MAX_CALLS} times "
             "in one analysis, and it is the most expensive tool available to "
             "you. Plan the whole checklist against that number before "
-            "spending the first call — ask one broad question that covers "
-            "several checklist items rather than one narrow question per "
-            "item, and do not re-ask something an earlier answer already "
-            "told you. When the budget runs out you will be told to write "
-            "the memo from what you have."
+            "spending the first call: ask the questions carrying the most of "
+            "the checklist first, so that if you run out you run out on the "
+            "least important ones rather than on whatever happened to come "
+            "last. Do not re-ask something an earlier answer already told "
+            "you. When the budget runs out you will be told to write the "
+            "memo from what you have.\n\n"
+            "`sections` restricts retrieval to the Items you name. Use it "
+            "when a filing says similar things in two places and you need "
+            "one of them: management's own ICFR conclusion lives in Item 9A "
+            "while the auditor's near-identical opinion on the same subject "
+            "sits in the financial statements, and without the filter the "
+            "statements win. Naming the Item in the question text does NOT "
+            "do this — it only dilutes the question. Take the names from "
+            "check_corpus's `sections_available`; anything else matches "
+            "nothing and the filter is discarded. Leave it off when you want "
+            "the whole filing."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "question": {"type": "string"},
                 "tickers": {"type": "array", "items": {"type": "string"}},
+                "sections": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Item labels to restrict to, e.g. ['Item 9A']. Use "
+                        "ONLY names from check_corpus's `sections_available` "
+                        "— an accounting note title such as 'Revenue "
+                        "Recognition' or 'Consolidated Statements of Income' "
+                        "is not a section and matches nothing. A chunk "
+                        "matches if any one of these is in its section path."
+                    ),
+                },
             },
             "required": ["question"],
         },
@@ -339,9 +373,11 @@ def _strictify(schema: dict) -> dict:
     recovered tool call still costs a turn against LOOP_MAX_TURNS — which
     the priciest runs already exhaust.
 
-    An optional property becomes `["<type>", "null"]`, and the dispatch
-    code reads those through `.get()`, so an explicit null behaves exactly
-    as the previously-absent key did.
+    An optional property becomes `["<type>", "null"]`, so a model that
+    leaves one unset sends an explicit null rather than omitting the key.
+    Dispatch code must read optional arguments as `inputs.get(k) or default`:
+    `inputs.get(k, default)` returns the None, not the default, and that is
+    how `ingest_ticker` came to send `limit: null` to /ingest.
     """
     if schema.get("type") != "object":
         return schema
@@ -493,6 +529,75 @@ async def execute_tool(name: str, inputs: dict) -> str:
     return result
 
 
+def _as_of_bound() -> dict:
+    """`{"filed_before": <analysis date>}`, or `{}` on an unbounded run.
+
+    The run's analysis date is the upper bound for every source in the
+    pipeline — prices and news enforce it, and the fundamentals leg did
+    not: it read whatever the corpus held, however recently filed. A memo
+    dated March could cite an August 10-K and say nothing about it.
+
+    Applied here, in dispatch, rather than asked of the model: the bound
+    holds whether or not the agent remembers it, and it stays out of every
+    tool schema so there is nothing for the model to set.
+    """
+    as_of = get_as_of()
+    return {"filed_before": as_of.isoformat()} if as_of else {}
+
+
+def _clamped_window(inputs: dict) -> dict:
+    """The model's own `filed_before`, never later than the run's bound."""
+    bound = _as_of_bound()
+    if not bound:
+        return {}
+    asked = inputs.get("filed_before")
+    if not asked:
+        return bound
+    return {"filed_before": min(str(asked), bound["filed_before"])}
+
+
+_SERVER_VERSION_CHECKED = False
+
+
+async def _warn_if_server_is_stale(http) -> None:
+    """Say so, once per process, if the API server is running other code.
+
+    On 2026-09-13 a 22-hour-old uvicorn served a full pipeline run. It
+    predated every fix the run was meant to verify, and the only symptom was
+    a date bound the old server silently dropped — FastAPI discards unknown
+    request fields, so nothing failed. The run finished, looking fine, and
+    verified nothing.
+
+    Best-effort and never fatal: an older server has no /health, and that is
+    itself the answer.
+    """
+    global _SERVER_VERSION_CHECKED
+    if _SERVER_VERSION_CHECKED:
+        return
+    _SERVER_VERSION_CHECKED = True
+    from app.infrastructure.build_info import COMMIT
+
+    try:
+        resp = await http.get(f"{API_BASE}/health", timeout=5)
+        served = resp.json().get("commit") if resp.status_code == 200 else None
+    except Exception:
+        served = None
+
+    if served is None:
+        logger.warning(
+            "the API server did not report a commit — it predates /health, so "
+            "it is running code older than this checkout. Restart it before "
+            "trusting this run."
+        )
+    elif COMMIT and served != COMMIT:
+        logger.warning(
+            "the API server is running %s but this process is %s. Its half of "
+            "the pipeline (ask_edgar, extract_metrics, check_corpus) is on "
+            "different code. Restart it before trusting this run.",
+            served, COMMIT,
+        )
+
+
 async def _dispatch(name: str, inputs: dict) -> str:
     if name == "calculate":
         expression = inputs["expression"]
@@ -507,7 +612,8 @@ async def _dispatch(name: str, inputs: dict) -> str:
             return err
 
         key = _normalize_expression(expression)
-        if key in _CALC_CACHE:
+        cache = _state().calc_cache
+        if key in cache:
             # Note honestly what this does and does not save. `calculate` is
             # pure Python with no API call, so the direct cost of a repeat is
             # ~zero and was already paid before this function ran: the
@@ -522,14 +628,14 @@ async def _dispatch(name: str, inputs: dict) -> str:
             # The note carries no digits of its own, so it adds nothing to
             # the provenance corpus the containment guards scan.
             return (
-                f"{_CALC_CACHE[key]}  [already computed earlier this run — "
+                f"{cache[key]}  [already computed earlier this run — "
                 f"identical expression, identical result. Check your earlier "
                 f"working before re-deriving a figure.]"
             )
 
         result = safe_calculate(expression, inputs.get("inputs", []))
         record_calc_result(result)
-        _CALC_CACHE[key] = result
+        cache[key] = result
         return result
 
     # Budget check BEFORE any transport is set up. A refused call has to
@@ -537,8 +643,8 @@ async def _dispatch(name: str, inputs: dict) -> str:
     # the check inside the HTTP context meant a refusal still built a
     # client. Caught by test_the_refusal_makes_no_http_call.
     if name == "ask_edgar":
-        global _ASK_EDGAR_CALLS
-        if _ASK_EDGAR_CALLS >= ASK_EDGAR_MAX_CALLS:
+        run = _state()
+        if run.ask_edgar_calls >= ASK_EDGAR_MAX_CALLS:
             # Refuse rather than raise: the agent's correct response is to
             # write the memo from what it has, exactly as it does at
             # MAX_TURNS. An exception would lose the whole run's work over a
@@ -551,18 +657,24 @@ async def _dispatch(name: str, inputs: dict) -> str:
                 f"record any checklist item you could not complete as an "
                 f"explicit data gap rather than leaving it unmentioned."
             )
-        _ASK_EDGAR_CALLS += 1
+        run.ask_edgar_calls += 1
 
     if USE_STUBS:
         return _stub(name, inputs)
 
     # STEP 2: real HTTP calls. Un-stub by setting USE_STUBS = False and
     # confirming each endpoint below matches your FastAPI routes.
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as http:
+    # The server's optional shared secret (see main.require_api_key). Sent
+    # only when configured, so an unauthenticated local server is unchanged.
+    api_key = os.getenv("APP_API_KEY")
+    headers = {"X-API-Key": api_key} if api_key else {}
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=headers) as http:
+        await _warn_if_server_is_stale(http)
         if name == "check_corpus":
             # STEP 2: confirm this route/param exists, or add it to main.py
             resp = await http.get(
-                f"{API_BASE}/corpus-status", params={"ticker": inputs["ticker"]}
+                f"{API_BASE}/corpus-status",
+                params={"ticker": inputs["ticker"], **_as_of_bound()},
             )
             if resp.status_code != 200:
                 return f"Error from /check_corpus: {resp.status_code} — {resp.text[:500]}"
@@ -570,8 +682,12 @@ async def _dispatch(name: str, inputs: dict) -> str:
             return resp.text
 
         if name == "ingest_ticker":
-            payload = {"ticker": inputs["ticker"], "limit": inputs.get("limit", 3)}
-            if "form_type" in inputs:
+            # `or`, not `.get(key, default)`: strict tool calling makes every
+            # optional argument required-but-nullable, so a model that leaves
+            # `limit` unset sends `"limit": null`. `.get("limit", 3)` returned
+            # None for that, and /ingest's `limit: int` rejected it with a 422.
+            payload = {"ticker": inputs["ticker"], "limit": inputs.get("limit") or 3}
+            if inputs.get("form_type"):
                 payload["form_type"] = inputs["form_type"]
             resp = await http.post(f"{API_BASE}/ingest", json=payload)
             if resp.status_code != 200:
@@ -580,14 +696,17 @@ async def _dispatch(name: str, inputs: dict) -> str:
             return resp.text
 
         if name == "ask_edgar":
-            resp = await http.post(
-                f"{API_BASE}/ask",
-                json={
-                    "question": inputs["question"],
-                    "tickers": inputs.get("tickers"),
-                    "k": ASK_EDGAR_K,
-                },
-            )
+            payload = {
+                "question": inputs["question"],
+                "tickers": inputs.get("tickers"),
+                # `or None`, not `.get(...)`: a model that means "no
+                # filter" sends [] about as often as it omits the key,
+                # and an empty list would filter everything out.
+                "section_path_contains": inputs.get("sections") or None,
+                "k": ASK_EDGAR_K,
+            }
+            payload.update(_as_of_bound())
+            resp = await http.post(f"{API_BASE}/ask", json=payload)
             if resp.status_code != 200:
                 return f"Error from /ask: {resp.status_code} — {resp.text[:500]}"
             _record_delegated_usage(resp)
@@ -606,7 +725,17 @@ async def _dispatch(name: str, inputs: dict) -> str:
                 for c in data.get("chunks", [])
             )
             out = f"{data['answer']}\n\nSources:\n{citations}"
-            remaining = ASK_EDGAR_MAX_CALLS - _ASK_EDGAR_CALLS
+            dropped = data.get("dropped_section_filter")
+            if dropped:
+                # Said plainly, because otherwise the agent reads an answer
+                # drawn from the whole filing as one drawn from the section
+                # it asked for.
+                out += (
+                    f"\n\nNote: no chunk is filed under {dropped}, so this "
+                    "answer covers the whole filing. Check the section paths "
+                    "in the citations before attributing it."
+                )
+            remaining = ASK_EDGAR_MAX_CALLS - _state().ask_edgar_calls
             if remaining <= _ASK_EDGAR_WARN_AT:
                 # Only inside the warn band. Appending a counter to all 30
                 # answers would put a changing number into every tool result,
@@ -629,14 +758,18 @@ async def _dispatch(name: str, inputs: dict) -> str:
             return out
 
         if name == "extract_metrics":
-            resp = await http.post(f"{API_BASE}/extract", json=inputs)
+            # The model chooses this window; the run's bound overrides the
+            # top of it. A model asking for metrics "through 2026" during a
+            # run dated March 2026 gets March, not 2026.
+            payload = {**inputs, **_clamped_window(inputs)}
+            resp = await http.post(f"{API_BASE}/extract", json=payload)
             if resp.status_code != 200:
                 return f"Error from /extract_metrics: {resp.status_code} — {resp.text[:500]}"
             _record_delegated_usage(resp)
             return resp.text
 
         if name == "check_latest_filings":
-            payload = {"ticker": inputs["ticker"]}
+            payload = {"ticker": inputs["ticker"], **_as_of_bound()}
             # Passed through only when the agent named its forms. Omitting
             # the key lets the server auto-detect the filer's family and
             # narrow it to periodic reports; sending form_types=None would
@@ -775,7 +908,7 @@ def validate_calculate_inputs(expression: str, inputs: list[dict]) -> str | None
             )
 
         # 5 — real value, wrong period label
-        outputs = _RETRIEVED_TEXT
+        outputs = _state().retrieved_text
         mismatched = []
         for i in inputs:
             if i.get("value") is None:
@@ -810,30 +943,64 @@ def validate_calculate_inputs(expression: str, inputs: list[dict]) -> str | None
 # ---------------------------------------------------------------------------
 # Run-scoped store of everything the tools have returned.
 #
-# Module-level, which assumes one agent run per process — true for the CLI.
-# If you ever run concurrent agents in one process, make this a context
-# object passed through execute_tool instead.
+# Held in a ContextVar, not module globals. As globals it assumed one agent
+# run per process — true for the CLI, false for the API server, where
+# /news-assess and /trading/analyze run the agent inside request handlers and
+# two overlapping requests shared (and reset) each other's provenance record
+# and ask_edgar budget. A wrong provenance record defeats the calculate guard
+# and the memo verifier without raising anything. Each asyncio task has its
+# own context, so each run now sees only its own state; `reset_run_provenance`
+# (called by `run_agent` at the start of every run) gives the current task a
+# fresh one.
 # ---------------------------------------------------------------------------
- 
-_RETRIEVED_TEXT: list[str] = []
-_CALC_RESULTS: list[float] = []
-_REJECTED_CALC_ATTEMPTS: list[dict] = []
-_SESSION_LOG: list[str] = []
 
-# Keyed by the model that spent it; None for a server too old to say.
-_DELEGATED_USAGE: dict[str | None, TokenUsage] = {}
+@dataclass
+class _RunState:
+    # The run's analysis date. Every filing-reading tool bounds itself at
+    # this date, so a historical run cannot retrieve a filing published
+    # after the date it claims to be analysing. None means "no bound" — the
+    # standalone research CLI answering about today.
+    #
+    # Held here rather than offered to the model as a tool argument on
+    # purpose: a bound the agent has to remember to apply is not a bound.
+    # It never appears in any tool schema.
+    as_of: date | None = None
+    retrieved_text: list[str] = field(default_factory=list)
+    calc_results: list[float] = field(default_factory=list)
+    rejected_calc_attempts: list[dict] = field(default_factory=list)
+    session_log: list[str] = field(default_factory=list)
+    # Keyed by the model that spent it; None for a server too old to say.
+    delegated_usage: dict[str | None, TokenUsage] = field(default_factory=dict)
+    ask_edgar_calls: int = 0
+    # Results by normalized expression, for the run.
+    calc_cache: dict[str, str] = field(default_factory=dict)
 
 
-def reset_run_provenance() -> None:
-    """Call once at the start of each agent run."""
-    global _ASK_EDGAR_CALLS
-    _RETRIEVED_TEXT.clear()
-    _CALC_RESULTS.clear()
-    _REJECTED_CALC_ATTEMPTS.clear()
-    _SESSION_LOG.clear()
-    _DELEGATED_USAGE.clear()
-    _ASK_EDGAR_CALLS = 0
-    _CALC_CACHE.clear()
+_RUN_STATE: ContextVar[_RunState | None] = ContextVar("research_run_state", default=None)
+
+
+def _state() -> _RunState:
+    """This task's run state, created on first use outside any run."""
+    state = _RUN_STATE.get()
+    if state is None:
+        state = _RunState()
+        _RUN_STATE.set(state)
+    return state
+
+
+def reset_run_provenance(as_of: date | None = None) -> None:
+    """Call once at the start of each agent run.
+
+    `as_of` is the run's analysis date, and becomes the upper bound every
+    filing-reading tool applies to itself. Omit it only where "now" is the
+    honest answer (the standalone research CLI, news assessment).
+    """
+    _RUN_STATE.set(_RunState(as_of=as_of))
+
+
+def get_as_of() -> date | None:
+    """The run's analysis date, or None when the run is unbounded."""
+    return _state().as_of
 
 
 def _record_delegated_usage(resp) -> None:
@@ -860,32 +1027,33 @@ def _record_delegated_usage(resp) -> None:
         logger.warning("ignoring malformed %s header: %r", USAGE_HEADER, raw[:120])
         return
     for model, usage in reported.items():
-        _DELEGATED_USAGE[model] = _DELEGATED_USAGE.get(model, TokenUsage()) + usage
+        delegated = _state().delegated_usage
+        delegated[model] = delegated.get(model, TokenUsage()) + usage
 
 
 def get_delegated_usage() -> dict[str | None, TokenUsage]:
     """Server-side spend since the last `reset_run_provenance()`, by the
     model that spent it. The key is None for usage from a server that did
     not name its model."""
-    return dict(_DELEGATED_USAGE)
+    return dict(_state().delegated_usage)
 
 def record_log_line(text: str) -> None:
     """Append a line to the run's session log — the full terminal trace
     (tool calls, tool results, agent commentary, turn markers) saved
     beside the report for post-run auditing."""
-    _SESSION_LOG.append(text)
+    _state().session_log.append(text)
 
 def get_session_log() -> str:
-    return "\n".join(_SESSION_LOG)
+    return "\n".join(_state().session_log)
 
 def record_calc_result(value: str | float) -> None:
     try:
-        _CALC_RESULTS.append(float(value))
+        _state().calc_results.append(float(value))
     except (TypeError, ValueError):
         pass
 
 def get_calc_results() -> list[float]:
-    return list(_CALC_RESULTS)
+    return list(_state().calc_results)
 
 def record_rejected_calc(expression: str, inputs: list[dict], reason: str) -> None:
     """Record a calculate() call the guard rejected. Also evaluates the raw
@@ -899,7 +1067,7 @@ def record_rejected_calc(expression: str, inputs: list[dict], reason: str) -> No
         value = float(attempted)
     except (TypeError, ValueError):
         value = None
-    _REJECTED_CALC_ATTEMPTS.append({
+    _state().rejected_calc_attempts.append({
         "expression": expression,
         "reason": reason,
         "attempted_result": value,
@@ -909,9 +1077,9 @@ def get_unretried_rejected_calcs() -> list[dict]:
     """Rejected calculate() attempts whose would-be result was never
     matched by a later successful calculate() call in this run — i.e. the
     model used (or may use) this number without ever validating it."""
-    retried = {round(v, 2) for v in _CALC_RESULTS}
+    retried = {round(v, 2) for v in _state().calc_results}
     out = []
-    for att in _REJECTED_CALC_ATTEMPTS:
+    for att in _state().rejected_calc_attempts:
         v = att["attempted_result"]
         if v is None or round(v, 2) in retried:
             continue
@@ -923,40 +1091,28 @@ def get_unretried_rejected_calcs() -> list[dict]:
     return out
 
 def get_provenance_corpus() -> str:
-    return "\n".join(_RETRIEVED_TEXT)
+    return "\n".join(_state().retrieved_text)
 
 def record_tool_output(text: str) -> None:
     """Record a tool result so its figures count as retrieved."""
     if text:
-        _RETRIEVED_TEXT.append(text)
+        _state().retrieved_text.append(text)
  
  
 def _provenance_corpus() -> str:
-    return "\n".join(_RETRIEVED_TEXT)
+    return "\n".join(_state().retrieved_text)
 
 # ---------------------------------------------------------------------------
 # Number matching — a tool returns "€11,384.0 million"; calculate gets 11384.0
 # ---------------------------------------------------------------------------
  
-def _variants(value: float) -> set[str]:
-    """String forms a tool output might use for this value."""
-    out: set[str] = set()
-    if value == int(value):
-        n = int(value)
-        out.update({str(n), f"{n:,}"})
-        # a tool may render a whole number with one decimal
-        out.update({f"{n}.0", f"{n:,}.0"})
-    else:
-        out.update({
-            f"{value}", f"{value:,}",
-            f"{value:.1f}", f"{value:,.1f}",
-            f"{value:.2f}", f"{value:,.2f}",
-        })
-    return out
- 
- 
 def _appears_in_output(value: float, corpus: str) -> bool:
-    return any(v in corpus for v in _variants(value))
+    """Token-anchored (app/application/number_matching.py). This was a
+    substring search, so a declared input counted as "retrieved" whenever its
+    digits sat inside any larger number — every two-digit integer inside a
+    year ("12" in "2012"), "7.4" inside "17.45". The memo verifier had
+    already been moved off that rule for the same reason; this check had not."""
+    return value_in_text(value, corpus)
 
 
 # ---------------------------------------------------------------------------
@@ -977,17 +1133,9 @@ def _fiscal_year(fiscal_period: str) -> str | None:
 
 
 def _occurrence_spans(value: float, text: str) -> list[tuple[int, int]]:
-    """Every (start, end) span where some string form of `value` occurs."""
-    spans: list[tuple[int, int]] = []
-    for v in _variants(value):
-        start = 0
-        while True:
-            idx = text.find(v, start)
-            if idx == -1:
-                break
-            spans.append((idx, idx + len(v)))
-            start = idx + len(v)
-    return spans
+    """Every (start, end) span of a numeric token in `text` that `value`
+    matches — the same token-anchored rule as `_appears_in_output`."""
+    return value_spans(value, text)
 
 
 def _year_near_any_occurrence(value: float, year: str, outputs: list[str]) -> bool:

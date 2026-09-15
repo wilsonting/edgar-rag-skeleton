@@ -234,6 +234,15 @@ def _format_aborted_run_markdown(state, terminated_by: RunTermination) -> str:
         f"**Spend at abort:** ${total_spend(events):.4f}"
         + (f" (budget ${budget.max_usd:.2f})" if budget else ""),
         f"**LLM calls logged:** {len(events)}",
+    ]
+    if state.get("node_budget_breach"):
+        lines += [
+            f"**Reason:** {state['node_budget_breach']}",
+            "",
+            "The call that crossed the node's cap is in docs/cost-log.jsonl "
+            "and in the run summary's total, but not in the spend above.",
+        ]
+    lines += [
         "",
         "## Stages reached",
         "",

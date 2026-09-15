@@ -1,17 +1,14 @@
 # eval/runner.py
 from datetime import date
 import json
-from re import sub
 import yaml
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.application.extraction_service import MetricsExtractor
 from app.application.query_decomposer import QueryDecomposer
 from app.application.retrieval_service import RetrievalService
 from app.application.embedding_service import EmbeddingService
 from app.infrastructure.repositories.chunk_repo import ChunkRepository
-from app.infrastructure.repositories.db import init_pool, close_pool
 from eval.question_embedding_cache import QuestionEmbeddingCache
 
 # eval/question_embedding_cache.py
@@ -109,26 +106,47 @@ async def get_or_embed(embedder, question: str) -> list[float]:
     CACHE_PATH.write_text(json.dumps(cache))
     return vec
 
+# What each mode measures, and what in production uses it.
+#
+# `full` is the default because it is the ONLY one that describes what a
+# real question goes through: POST /ask calls retrieve_full — decomposition
+# AND hybrid — and nothing in this harness used to exercise it. The harness
+# offered three modes: hybrid without decomposition, decomposition without
+# hybrid, and plain vector. So every retrieval number this project has
+# published describes a path no caller takes. The BM25 change in particular
+# was justified by numbers measured without decomposition, and fusion
+# behaves differently when its inputs are sub-queries.
+MODES = {
+    "full": "retrieve_full — decomposition + hybrid. What POST /ask does.",
+    "hybrid": "retrieve_hybrid — vector + BM25, no decomposition. What metric extraction does.",
+    "vector": "vector search alone, from the question-embedding cache. The zero-spend baseline.",
+}
+DEFAULT_MODE = "full"
+
+
 async def run_eval(
-    test_set_path: Path, 
-    k: int = 10, 
-    use_decomposition = False,
-    use_hybrid: bool = False
-    ) -> list[QuestionResult]:
+    test_set_path: Path,
+    k: int = 10,
+    mode: str = DEFAULT_MODE,
+) -> list[QuestionResult]:
+    if mode not in MODES:
+        raise ValueError(
+            f"unknown eval mode {mode!r}. Choose one of:\n  "
+            + "\n  ".join(f"{name}: {what}" for name, what in MODES.items())
+        )
+
     test_set = yaml.safe_load(test_set_path.read_text())
     if not test_set or "questions" not in test_set:
         raise ValueError(f"{test_set_path} must have a top-level 'questions' key")
     questions = test_set["questions"]
     if not questions:
         raise ValueError(f"{test_set_path} has no questions")
-    
+
     embedder = EmbeddingService()
-    decomposer = QueryDecomposer() if use_decomposition else None
-    retrieval = RetrievalService(
-        embedder, ChunkRepository(),
-        decomposer=decomposer,
-        use_hybrid=use_hybrid
-    )
+    # The decomposer costs money per question, so it is built only for the
+    # mode that uses it.
+    decomposer = QueryDecomposer() if mode == "full" else None
+    retrieval = RetrievalService(embedder, ChunkRepository(), decomposer=decomposer)
     cache = QuestionEmbeddingCache(CACHE_PATH)
 
     results: list[QuestionResult] = []
@@ -136,16 +154,16 @@ async def run_eval(
         for q in questions:
             components = _parse_components(q)
 
-            if use_hybrid:
-                retrieved = await retrieval.retrieve_hybrid(q["question"], k=k)
-                was_decomposed = False
-                sub_queries = [q["question"]]
-            elif use_decomposition:
-                retrieved, decomposition = await retrieval.retrieve_with_decomposition(
+            if mode == "full":
+                retrieved, decomposition = await retrieval.retrieve_full(
                     q["question"], k=k
                 )
                 was_decomposed = decomposition.was_decomposed
                 sub_queries = decomposition.sub_queries
+            elif mode == "hybrid":
+                retrieved = await retrieval.retrieve_hybrid(q["question"], k=k)
+                was_decomposed = False
+                sub_queries = [q["question"]]
             else:
                 question_vec = await cache.get_or_embed(embedder, q["question"])
                 retrieved = await retrieval.retrieve_by_embedding(question_vec, k=k)

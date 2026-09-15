@@ -1,15 +1,11 @@
 import logging
-from dotenv import load_dotenv
 
-from app.domain.token_usage import TokenUsage
+from app.domain.token_usage import TokenUsage, response_text
 from dataclasses import dataclass, field
-from app.chunk import Chunk, Chunks
 from app.infrastructure.repositories.chunk_repo import RetrievedChunk
 from app.application.citations import format_citation_tag, format_context_block
 from app.infrastructure.llm import get_client
 from app.infrastructure.llm.models import model_for
-
-load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +65,20 @@ async def answer_question(
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_message}],
     )
-    answer_text = resp.content[0].text
+    answer_text = response_text(resp)
+    if not answer_text.strip():
+        # An empty completion is an answer of sorts — "the model returned
+        # nothing" — and saying so beats an IndexError surfacing as a 500.
+        logger.warning(
+            "model %s returned no text for the question (stop_reason=%s); "
+            "returning an explicit empty answer",
+            model, getattr(resp, "stop_reason", None),
+        )
+        answer_text = (
+            "The model returned no answer for this question. This usually "
+            "means the response was cut off at the output-token limit. "
+            "Re-ask with a narrower question."
+        )
 
     # Lightweight citation extraction — find tags actually mentioned in answer
     expected_tags = {format_citation_tag(c) for c in chunks}

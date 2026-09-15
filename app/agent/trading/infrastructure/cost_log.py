@@ -19,14 +19,13 @@ import json
 import logging
 import uuid
 from datetime import date, datetime
-from pathlib import Path
 
 from app.agent.researcher import UsageSummary
 from app.agent.trading.domain.budget import CostEvent, RunBudget, RunTermination, total_spend
+from app.infrastructure.cost_log_path import cost_log_path, readable_logs
 
 logger = logging.getLogger(__name__)
 
-_COST_LOG_PATH = Path("docs/cost-log.jsonl")
 
 # The growing-transcript stages criterion 3's cache-read ratio is about —
 # NOT the analyst or synthesis nodes, whose evidence pack is sent once, not
@@ -85,20 +84,22 @@ def _disk_logged_events(run_id: str) -> list[dict]:
     double-count risk the way trusting `cost_events` alone is an
     under-count risk.
     """
-    if not _COST_LOG_PATH.exists():
-        return []
     events: list[dict] = []
-    with _COST_LOG_PATH.open() as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if entry.get("kind") == "cost_event" and entry.get("run_id") == run_id:
-                events.append(entry)
+    # The log rotates monthly, so a run's lines can be in this month's file,
+    # the previous one (a run can straddle the 1st), or the pre-rotation
+    # file. See infrastructure/cost_log_path.
+    for path in readable_logs():
+        with path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("kind") == "cost_event" and entry.get("run_id") == run_id:
+                    events.append(entry)
     return events
 
 
@@ -122,6 +123,7 @@ def log_run_summary(
     budget: RunBudget,
     terminated_by: RunTermination,
     wall_clock_s: float,
+    resumed: bool = False,
 ) -> None:
     """Written exactly once per run — completed or aborted — right after the
     vault artifacts save in cli.py. That one-line-per-run invariant is what
@@ -170,7 +172,12 @@ def log_run_summary(
         "cache_read_ratio": _cache_read_ratio(events),
         "n_events": n_events,
         "wall_clock_s": round(wall_clock_s, 3),
+        # A resumed run's summary covers the whole run's spend (the disk
+        # reconciliation above sums every attempt), but its wall clock is the
+        # resumed attempt's alone. Flagged so a query can tell the two apart.
+        "resumed": resumed,
     }
-    _COST_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _COST_LOG_PATH.open("a") as f:
+    path = cost_log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
         f.write(json.dumps(entry) + "\n")

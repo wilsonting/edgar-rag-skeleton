@@ -45,13 +45,16 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 from collections import Counter
 from dataclasses import dataclass, field
 
+from app.agent.trading.infrastructure.structured_call import (
+    assert_within_budget,
+    call_with_schema_retry,
+    force_crash,
+)
 from app.infrastructure.llm import LLMClient, get_client
 from app.infrastructure.llm.models import model_for, warn_if_unpriced
-from pydantic import ValidationError
 
 from app.agent.researcher import (
     UsageSummary,
@@ -100,10 +103,7 @@ _CRASH_AT = os.getenv("SYNTHESIS_CRASH_AT")   # "research" | "risk_judge" | None
 def _maybe_crash(when: str) -> None:
     if _CRASH_AT != when:
         return
-    print(f"[synthesis] FORCED CRASH at {when} (SYNTHESIS_CRASH_AT)")
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(1)
+    force_crash("synthesis", f"at {when} (SYNTHESIS_CRASH_AT)")
 
 
 class SynthesisReferenceError(Exception):
@@ -654,67 +654,19 @@ async def _call_model(
     )
 
 
-def _tool_block(response):
-    return next((b for b in response.content if b.type == "tool_use"), None)
-
-
-def _extract(response, payload_cls, tool_name: str):
-    block = _tool_block(response)
-    if block is None:
-        raise ValidationError.from_exception_data(
-            payload_cls.__name__, [{"type": "missing", "loc": (tool_name,), "input": None}]
-        )
-    return payload_cls.model_validate(block.input)
-
-
-_CORRECTION = (
-    "That submission did not validate:\n{error}\n\n"
-    "Call {tool} once more, correcting exactly those fields. Change nothing else."
-)
-
-
-def _retry_messages(messages: list[dict], response, error: Exception, tool_name: str) -> list[dict]:
-    turns = list(messages)
-    if response.content:
-        turns.append({"role": "assistant", "content": response.content})
-    correction = _CORRECTION.format(error=error, tool=tool_name)
-    results = [
-        {"type": "tool_result", "tool_use_id": b.id, "is_error": True, "content": correction}
-        for b in response.content
-        if b.type == "tool_use"
-    ]
-    turns.append({"role": "user", "content": results or correction})
-    return turns
-
-
-def _accumulate(usage: UsageSummary, raw) -> None:
-    usage.input_tokens += raw.input_tokens
-    usage.cache_write_tokens += raw.cache_creation_input_tokens or 0
-    usage.cache_read_tokens += raw.cache_read_input_tokens or 0
-    usage.output_tokens += raw.output_tokens
-
-
 async def _call_with_schema_retry(
     client: LLMClient, model: str, tool: dict, payload_cls,
     system_blocks: list[dict], messages: list[dict], usage: UsageSummary,
     temperature: float | None,
 ):
-    response = await _call_model(client, model, tool, system_blocks, messages, temperature)
-    _accumulate(usage, response.usage)
-    try:
-        return _extract(response, payload_cls, tool["name"])
-    except ValidationError as first:
-        block = _tool_block(response)
-        print(
-            f"[synthesis] {tool['name']}: schema violation, one retry — "
-            f"stop_reason={response.stop_reason} "
-            f"keys={sorted(block.input) if block else None} "
-            f"— {'; '.join(str(first).splitlines()[1:5])}"
-        )
-        retry_messages = _retry_messages(messages, response, first, tool["name"])
-        retry = await _call_model(client, model, tool, system_blocks, retry_messages, temperature)
-        _accumulate(usage, retry.usage)
-        return _extract(retry, payload_cls, tool["name"])   # a second failure raises out
+    return await call_with_schema_retry(
+        lambda msgs: _call_model(client, model, tool, system_blocks, msgs, temperature),
+        payload_cls=payload_cls,
+        tool_name=tool["name"],
+        messages=messages,
+        usage=usage,
+        label=f"[synthesis] {tool['name']}",
+    )
 
 
 async def _resolve_with_retry(
@@ -752,12 +704,12 @@ async def _resolve_with_retry(
 
 
 def _assert_within_budget(ticker: str, total_cost: float) -> None:
-    if total_cost > SYNTHESIS_BUDGET_USD:
-        raise AssertionError(
-            f"synthesis cost ${total_cost:.4f} for {ticker} exceeds the "
-            f"${SYNTHESIS_BUDGET_USD:.2f} combined Research Manager + Risk Judge "
-            f"budget — check the model routing and evidence pack size before rerunning"
-        )
+    assert_within_budget(
+        total_cost, SYNTHESIS_BUDGET_USD,
+        what="synthesis", context=f" for {ticker}",
+        budget="combined Research Manager + Risk Judge budget",
+        check="the model routing and evidence pack size",
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -209,3 +209,77 @@ def test_get_price_history_raises_if_a_vendor_leaks_a_future_bar(monkeypatch):
 
     with pytest.raises(AssertionError, match="Lookahead leak"):
         asyncio.run(pdp.get_price_history("TICK", as_of))
+
+
+# ---------------------------------------------------------------------------
+# A failed fetch and an empty one are different things
+# ---------------------------------------------------------------------------
+
+def test_a_vendor_exception_is_logged_not_swallowed(monkeypatch, caplog):
+    """Both helpers caught bare Exception and returned None with no log, so a
+    rate limit, an auth failure and "this ticker has no data" were
+    indistinguishable — and behind a fallback chain, a broken primary vendor
+    looked like a normal secondary hit."""
+    import logging
+    from datetime import date as _date
+
+    from app.agent.trading.infrastructure import price_data_port as port
+
+    class _Boom:
+        def __init__(self, ticker):
+            pass
+
+        def history(self, **kw):
+            raise RuntimeError("429 Too Many Requests")
+
+    monkeypatch.setattr(port.yf, "Ticker", _Boom)
+
+    with caplog.at_level(logging.WARNING, logger=port.logger.name):
+        df, vendor = port._try_yfinance("ACN", _date(2026, 3, 1))
+
+    assert df is None and vendor == "yfinance"
+    assert "yfinance failed for ACN" in caplog.text
+    assert "429 Too Many Requests" in caplog.text
+
+
+def test_no_bars_is_logged_as_no_bars_not_as_a_failure(monkeypatch, caplog):
+    import logging
+    from datetime import date as _date
+
+    import pandas as pd
+
+    from app.agent.trading.infrastructure import price_data_port as port
+
+    class _Empty:
+        def __init__(self, ticker):
+            pass
+
+        def history(self, **kw):
+            return pd.DataFrame()
+
+    monkeypatch.setattr(port.yf, "Ticker", _Empty)
+
+    with caplog.at_level(logging.WARNING, logger=port.logger.name):
+        df, _ = port._try_yfinance("ACN", _date(2026, 3, 1))
+
+    assert df is None
+    # WARNING, not INFO. A live FIG run at --as-of 2026-03-01 died with
+    # "No price data for FIG from yfinance or Finnhub" and no record of what
+    # either vendor said, because this line was INFO and the trading CLI
+    # configured no logging at all. Returning None here is never routine.
+    assert "returned no bars" in caplog.text
+    assert "failed" not in caplog.text
+
+
+def test_the_trading_cli_configures_logging():
+    """Without this, every logger.info in the pipeline goes nowhere and
+    WARNING arrives via Python's handler-of-last-resort — unformatted, with
+    no logger name. app/cli.py always did it; the entry point that spends
+    the most per invocation did not."""
+    import inspect
+
+    import app.agent.trading.interface.cli as trading_cli
+
+    source = inspect.getsource(trading_cli.main)
+    assert "logging.basicConfig" in source
+    assert "logging.INFO" in source

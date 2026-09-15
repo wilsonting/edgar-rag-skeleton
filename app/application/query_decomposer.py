@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 import logging
 
-from app.domain.token_usage import TokenUsage
+from app.domain.token_usage import TokenUsage, response_text
 import re
 from app.infrastructure.llm import create_with_temperature_fallback, get_client
 from app.infrastructure.llm.models import model_for
@@ -157,7 +157,9 @@ class QueryDecomposer:
                 "content": prompt,
             }],
         )
-        raw = resp.content[0].text.strip()
+        # Falls back to the original question below when this is empty,
+        # which is the same path an unusable rewrite already took.
+        raw = response_text(resp).strip()
         sub_queries = [
             line.strip()
             for line in raw.splitlines()

@@ -1,9 +1,5 @@
 import os
 
-from dotenv import load_dotenv
-
-load_dotenv(override=True)
-
 # Best-effort only, and deliberately placed above the langgraph imports:
 # langgraph.checkpoint.serde._msgpack freezes STRICT_MSGPACK_ENABLED into a
 # module-level constant at import time, so setting this afterwards does
@@ -23,7 +19,15 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # noqa: E402
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer  # noqa: E402
 from psycopg_pool import AsyncConnectionPool  # noqa: E402
 
-DB_URI = os.getenv("TRADING_CHECKPOINT_DB_URI")
+from app.config import require_env  # noqa: E402
+
+# Read at call time, not import time: this module is imported by the graph
+# builder, and an import-time read would make every test that never opens a
+# checkpointer depend on the variable being set.
+def _db_uri() -> str:
+    """Unset, this used to be None, and `AsyncConnectionPool(conninfo=None)`
+    fails several frames away with nothing naming the variable."""
+    return require_env("TRADING_CHECKPOINT_DB_URI")
 
 connection_kwargs = {"autocommit": True, "prepare_threshold": 0}
 
@@ -79,7 +83,7 @@ def build_serde() -> JsonPlusSerializer:
 @asynccontextmanager
 async def build_checkpointer():
     async with AsyncConnectionPool(
-        conninfo=DB_URI, max_size=10, kwargs=connection_kwargs, open=False
+        conninfo=_db_uri(), max_size=10, kwargs=connection_kwargs, open=False
     ) as pool:
         await pool.open()
         checkpointer = AsyncPostgresSaver(pool, serde=build_serde())
